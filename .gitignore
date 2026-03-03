@@ -6,3 +6,4 @@ Others/
 .telegram_bar_sent/
 docs/
 position_status_sentinel/
+scheduler.db

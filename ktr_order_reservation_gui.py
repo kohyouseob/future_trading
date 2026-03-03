@@ -679,9 +679,9 @@ def _rsi_series(closes_chron: List[float], period: int = 14) -> Optional[List[fl
 
 
 def _is_rsi_downtrend(symbol: str) -> bool:
-    """1H 직전 마감 봉 RSI가 그 이전 봉 RSI보다 낮으면 True(하향 추세). 판별 불가 시 False(매수 허용)."""
-    h1 = getattr(mt5, "TIMEFRAME_H1", 16385)
-    rates = get_rates_for_timeframe(symbol, h1, count=30)
+    """10분봉 직전 마감 봉 RSI가 그 이전 봉 RSI보다 낮으면 True(하향 추세). 판별 불가 시 False(매수 허용)."""
+    m10 = getattr(mt5, "TIMEFRAME_M10", 10)
+    rates = get_rates_for_timeframe(symbol, m10, count=30)
     if rates is None or len(rates) < 17:
         return False
     # MT5: rates[0]=현재봉, rates[1]=직전 마감, rates[2]=그 이전. 과거→현재 순으로 종가 리스트(마감 봉만)
@@ -1649,9 +1649,9 @@ def _execute_ktr_entry(
         if (side or "").strip().upper() == "SELL" and touched_lower:
             log_fn("❌ 오더 미실행 사유: 10분봉 매도 진입 시 1H 직전 봉 20B 하단 터치 → 매도 보류.")
             return False, None, None
-    # RSI 시그널 하향 추세(1H 직전 봉 RSI < 그 이전 봉 RSI)면 매수 주문 차단
+    # RSI 시그널 하향 추세(10분봉 직전 봉 RSI < 그 이전 봉 RSI)면 매수 주문 차단
     if (side or "").strip().upper() == "BUY" and _is_rsi_downtrend(symbol):
-        log_fn("❌ 오더 미실행 사유: RSI 하향 추세(1H 직전 봉 RSI 하락) → 매수 보류.")
+        log_fn("❌ 오더 미실행 사유: RSI 하향 추세(10분봉 직전 봉 RSI 하락) → 매수 보류.")
         return False, None, None
     # 자동: 진입 시점에 DB에서 가장 최근 기록된 KTR 사용. 그 외: 해당 세션(또는 이전 세션 폴백)
     ktr_value, resolved_session, session_used, tf_used = get_ktr_from_db_with_fallback(symbol, session, tf)
@@ -2165,6 +2165,10 @@ class KTRReservationApp:
             ttk.Radiobutton(cond_f, text=val, variable=self.var_entry_condition, value=val).pack(
                 side=tk.LEFT, padx=(0, 12)
             )
+        ttk.Label(left_f, text="진입시간").grid(row=row, column=2, sticky=tk.W, padx=(24, 0), pady=2)
+        self.var_entry_time = tk.StringVar(value="")
+        self.entry_time_entry = ttk.Entry(left_f, textvariable=self.var_entry_time, width=12)
+        self.entry_time_entry.grid(row=row, column=3, sticky=tk.W, pady=2)
         row += 1
 
         ttk.Label(left_f, text="비중").grid(row=row, column=0, sticky=tk.W, pady=2)
@@ -2239,6 +2243,7 @@ class KTRReservationApp:
             "side",
             "tf",
             "conditions",
+            "entry_time",
             "weight",
             "n",
             "session",
@@ -2252,6 +2257,7 @@ class KTRReservationApp:
         self.tree.heading("side", text="매수/매도")
         self.tree.heading("tf", text="타임프레임")
         self.tree.heading("conditions", text="진입조건")
+        self.tree.heading("entry_time", text="진입시간")
         self.tree.heading("weight", text="비중")
         self.tree.heading("n", text="N")
         self.tree.heading("session", text="KTR세션")
@@ -2260,6 +2266,7 @@ class KTRReservationApp:
         for c in cols:
             self.tree.column(c, width=72)
         self.tree.column("conditions", width=140)
+        self.tree.column("entry_time", width=72)
         self.tree.column("created", width=100)
         self.tree.grid(row=1, column=0, sticky=tk.NSEW, pady=2)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
@@ -3090,6 +3097,7 @@ class KTRReservationApp:
             "timeframe_label": tf_label,
             "mt5_timeframe": int(TF_MAP.get(tf_label, mt5.TIMEFRAME_H1)),
             "conditions": conditions,
+            "entry_time": (self.var_entry_time.get() or "").strip(),
             "weight_pct": risk,
             "n_value": n_for_ktrlots,
             "n_display": n_display_str,
@@ -3165,6 +3173,7 @@ class KTRReservationApp:
         conditions = r.get("conditions", [])
         cond0 = conditions[0] if conditions else ENTRY_CONDITIONS[0]
         self.var_entry_condition.set(cond0 if cond0 in ENTRY_CONDITIONS else ENTRY_CONDITIONS[0])
+        self.var_entry_time.set(r.get("entry_time", "") or "")
         w = r.get("weight_pct", 10)
         if w == "전저점":
             weight_str = "전저점"
@@ -3205,6 +3214,7 @@ class KTRReservationApp:
             snapshot = list(self.reservations)
         for r in snapshot:
             cond_str = ",".join(r.get("conditions", []))
+            entry_time_str = (r.get("entry_time") or "").strip() or "—"
             self.tree.insert(
                 "",
                 tk.END,
@@ -3213,6 +3223,7 @@ class KTRReservationApp:
                     r.get("side", ""),
                     r.get("timeframe_label", ""),
                     cond_str,
+                    entry_time_str,
                     "전저점" if r.get("weight_pct") == "전저점" else ("최대" if r.get("weight_pct", 0) == 0 else str(r.get("weight_pct", 0)) + "%"),
                     r.get("n_display", r.get("n_value", "")),
                     r.get("session", "자동"),
@@ -3723,6 +3734,17 @@ class KTRReservationApp:
                         if matched:
                             side_r = (r.get("side") or "BUY").strip().upper()
                             tf_str_r = _MT5_TF_TO_STR.get(mt5_tf, "H1")
+                            entry_time_s = (r.get("entry_time") or "").strip()
+                            if entry_time_s:
+                                entry_dt = _parse_scheduled_time_kst(entry_time_s)
+                                if entry_dt is not None and now_kst < entry_dt:
+                                    self.root.after(
+                                        0,
+                                        lambda sym=symbol, et=entry_time_s: self._log(
+                                            f"⏭️ {sym} 진입조건 충족 but 진입시간({et}) 미도달 → 대기"
+                                        ),
+                                    )
+                                    continue
                             if _allowed_by_sma20_filter(symbol, matched_cond or "", side_r, tf_str_r):
                                 matched_by_symbol.setdefault(symbol, []).append((r, matched_cond, detail_msg))
                             else:
