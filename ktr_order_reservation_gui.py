@@ -342,6 +342,21 @@ _TF_ORDER = {"10M": 0, "1H": 1}
 _TF_EXECUTION_ORDER = {"10분봉": 0, "1시간봉": 1}
 
 
+def _reservation_check_order_key(r: Dict[str, Any]) -> Tuple[int, float, float]:
+    """예약 오더 점검 순서: 타임프레임(큰 것) → 비중(큰 것) → N값(큰 것) 순. 반환값이 클수록 먼저 점검."""
+    tf_order = _TF_EXECUTION_ORDER.get((r.get("timeframe_label") or "").strip(), -1)
+    wp = r.get("weight_pct", 0)
+    if wp == "전저점" or (isinstance(wp, (int, float)) and wp == 0):
+        weight_num = 10.0
+    else:
+        try:
+            weight_num = float(wp)
+        except (TypeError, ValueError):
+            weight_num = 0.0
+    n_val = float(r.get("n_value", 0))
+    return (tf_order, weight_num, n_val)
+
+
 def _is_larger_timeframe(new_tf: str, existing_tf: Optional[str]) -> bool:
     """new_tf가 existing_tf보다 더 큰 타임프레임이면 True (예: 1H > 10M)."""
     if not (new_tf and existing_tf):
@@ -3211,17 +3226,7 @@ class KTRReservationApp:
                 "기본더블비는 N값 2.5 이상 또는 '없음'만 선택할 수 있습니다.\nN값 1.5로는 오더가 생성되지 않습니다.",
             )
             return
-        # 돌파더블비 선택 시: 직전 봉에서 4B 상단 돌파 마감이 있었는지 확인
-        if "돌파더블비" in conditions:
-            mt5_tf = int(TF_MAP.get(tf_label, mt5.TIMEFRAME_H1))
-            matched, detail, _ = _check_entry_condition_one_with_detail(symbol, mt5_tf, "돌파더블비")
-            if not matched:
-                messagebox.showwarning(
-                    "돌파더블비 조건 미충족",
-                    "돌파더블비는 직전 봉에서 4B 상단 돌파 마감이 확인된 경우에만 등록할 수 있습니다.\n\n"
-                    + (f"상세: {detail}" if detail else "현재 직전 봉이 조건을 만족하지 않습니다."),
-                )
-                return
+        # 예약 오더: 돌파더블비 판정 없이 등록 가능 (돌파더블비 판정은 실시간 실행 시에만 적용)
         if n_str == "없음":
             num_positions = 1
             n_for_ktrlots = 1.0
@@ -3870,18 +3875,24 @@ class KTRReservationApp:
                     _update_trailing_stop_50pct(_trailing_log_fn)
 
                 # [우선 실행] 예약 오더 진입 점검·실행 — 해당 타임프레임 봉 마감 시점에만 점검·진입
+                # 점검 순서: 타임프레임(큰 것) → 비중(큰 것) → N값(큰 것). 한 건이라도 오더 생성되면 이번 사이클에서는 추가 실행 안 함.
                 reservation_check_log_lines = []  # 미충족 시 텔레그램 전송용 (맨 윗줄 "[예약 체크]"는 전송 시에만 추가)
                 if now_kst.hour != 7:
-                    matched_by_symbol: Dict[str, List[tuple]] = {}
+                    order_candidates = [
+                        r for r in active_list
+                        if r.get("conditions") and r.get("conditions")[0] not in REALTIME_KTR_CONDITIONS
+                    ]
+                    order_candidates.sort(key=_reservation_check_order_key, reverse=True)
                     check_index = 0
-                    for r in active_list:
+                    triggered_this_cycle = False
+                    for r in order_candidates:
+                        if triggered_this_cycle:
+                            break
                         symbol = r.get("symbol", "")
                         mt5_tf = r.get("mt5_timeframe", mt5.TIMEFRAME_H1)
                         conditions = r.get("conditions", [])
                         if not conditions:
                             continue
-                        if conditions[0] in REALTIME_KTR_CONDITIONS:
-                            continue  # 실시간+KTR은 위에서 별도 처리
                         # 모든 진입조건: 해당 TF 봉 직전 마감 시점에만 점검 (봉 마감 후 진입)
                         is_bar_closed = _is_bar_just_closed_for_timeframe_kst(mt5_tf, now_kst)
                         if not is_bar_closed:
@@ -3904,7 +3915,14 @@ class KTRReservationApp:
                                     )
                                     continue
                             if _allowed_by_sma20_filter(symbol, matched_cond or "", side_r, tf_str_r):
-                                matched_by_symbol.setdefault(symbol, []).append((r, matched_cond, detail_msg))
+                                self.root.after(
+                                    0,
+                                    lambda res=r, cond=matched_cond, msg=detail_msg: self._trigger_entry(
+                                        res, detail_msg=msg, matched_condition=cond
+                                    ),
+                                )
+                                triggered_this_cycle = True
+                                break
                             else:
                                 pos_tf = _tf_sma20_position(symbol, tf_str_r) if side_r == "BUY" else _1h_sma20_position(symbol)
                                 req = f"{tf_str_r} 20이평 아래" if side_r == "BUY" else "1H 20이평 위"
@@ -3935,26 +3953,6 @@ class KTRReservationApp:
                                     for log_line in log_lines:
                                         self.root.after(0, lambda msg=log_line: self._log(msg))
                                     self.root.after(0, lambda: self._log(""))
-                    for symbol, candidates in matched_by_symbol.items():
-                        best = max(
-                            candidates,
-                            key=lambda x: _TF_EXECUTION_ORDER.get((x[0].get("timeframe_label") or "").strip(), -1),
-                        )
-                        res, matched_cond, detail_msg = best
-                        self.root.after(
-                            0,
-                            lambda res=res, cond=matched_cond, msg=detail_msg: self._trigger_entry(
-                                res, detail_msg=msg, matched_condition=cond
-                            ),
-                        )
-                        if len(candidates) > 1:
-                            tf_label = (res.get("timeframe_label") or "").strip()
-                            self.root.after(
-                                0,
-                                lambda s=symbol, tf=tf_label, n=len(candidates): self._log(
-                                    f"[예약 실행] {s} 동시 {n}건 충족 → 가장 큰 TF({tf}) 1건만 실행"
-                                ),
-                            )
                     if reservation_check_log_lines:
                         try:
                             telegram_header = f"[예약 체크 - 점검 시각 {now_kst.strftime('%Y-%m-%d %H:%M')} KST]"
