@@ -215,6 +215,23 @@ def has_ktr_for_session_timeframe_date_supabase(session: str, timeframe: str, re
     return bool(data)
 
 
+def has_both_ktr_symbols_for_slot_supabase(session: str, timeframe: str, record_date: str) -> bool:
+    """해당 (세션, 타임프레임, 측정일)에 NAS100·XAUUSD 두 심볼 모두 있으면 True. 누락 판정용."""
+    if not record_date or not isinstance(record_date, str):
+        return False
+    rd = record_date.strip()[:10]
+    data = _get_supabase(
+        "ktr_records",
+        "symbol",
+        filters={"session": f"eq.{session}", "timeframe": f"eq.{timeframe}", "record_date": f"eq.{rd}"},
+        limit=10,
+    )
+    if not data:
+        return False
+    found = {r.get("symbol") for r in data if r.get("symbol")}
+    return "NAS100" in found and "XAUUSD" in found
+
+
 def get_latest_ktr_supabase(symbol: str, session: str, timeframe: str) -> Optional[float]:
     """해당 symbol, session, timeframe의 최신 ktr_value. 없으면 None."""
     data = _get_supabase(

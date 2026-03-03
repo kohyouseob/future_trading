@@ -22,7 +22,7 @@ import os
 import sys
 import MetaTrader5 as mt5
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # v2 루트를 path에 추가 (다른 cwd에서 실행 시 아래 import를 위해)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -144,7 +144,14 @@ def get_ktr_from_pm_db(symbol_name: str, session: str, timeframe: str, record_da
     아시아 5M: 6:55+8:00 두 봉 합산. 아시아 10M: 6:50+8:00 두 봉 합산. 아시아 1H: 08:00 1H 봉 + 10분봉 06:50 봉 합산."""
     if _pm_db is None:
         return None, None
-    date_prefix = (record_date or datetime.now(KST).strftime("%Y-%m-%d")).strip()[:10]
+    record_prefix = (record_date or datetime.now(KST).strftime("%Y-%m-%d")).strip()[:10]
+    # US 세션: 봉은 전날 23:00/23:30에 열리므로 record_date가 세션 마감일일 때 DB 검색은 전날
+    try:
+        rd = datetime.strptime(record_prefix, "%Y-%m-%d").date()
+        bar_date = (rd - timedelta(days=1)) if (session == "US" and timeframe in ("1H", "5M", "10M")) else rd
+        date_prefix = bar_date.strftime("%Y-%m-%d")
+    except Exception:
+        date_prefix = record_prefix
     sym = _symbol_for_pm_db(symbol_name)
     if timeframe == "5M":
         tf, hour, minute = "M5", SESSION_BAR_5M[session][0], SESSION_BAR_5M[session][1]
@@ -257,6 +264,8 @@ def get_ktr_from_mt5(symbol_name: str, session: str, timeframe: str, record_date
 
     if timeframe == "5M":
         hour, minute = SESSION_BAR_5M[session][0], SESSION_BAR_5M[session][1]
+        # US 5M: 봉은 전날 23:30, record_date는 세션 마감일(당일 00:00) → 봉은 전날 날짜로 검색
+        bar_date_5m = target_date - timedelta(days=1) if session == "US" else target_date
         rates = mt5.copy_rates_from_pos(sym, mt5_m5, 0, count)
         if rates is None or len(rates) == 0:
             return None, None
@@ -275,17 +284,19 @@ def get_ktr_from_mt5(symbol_name: str, session: str, timeframe: str, record_date
                 high_max = max(found[0][0], found[1][0])
                 low_min = min(found[0][1], found[1][1])
                 return round(high_max - low_min, 2), f"{target_date} 06:55+08:00"
-        # 그 외 세션: 기존 단일 봉
+        # 그 외 세션: 기존 단일 봉 (US는 bar_date_5m 사용)
         for i in range(len(rates)):
             bar_ts = int(rates["time"][i])
             bar_dt = mt5_ts_to_kst(bar_ts)
-            if bar_dt.date() == target_date and bar_dt.hour == hour and bar_dt.minute == minute:
+            if bar_dt.date() == bar_date_5m and bar_dt.hour == hour and bar_dt.minute == minute:
                 high, low = float(rates["high"][i]), float(rates["low"][i])
                 return round(high - low, 2), bar_dt.strftime("%Y-%m-%d %H:%M")
         return None, None
 
     if timeframe == "10M":
         hour, minute = SESSION_BAR_10M[session][0], SESSION_BAR_10M[session][1]
+        # US 10M: 봉은 전날 23:30/23:35, record_date는 세션 마감일 → 봉은 전날 날짜로 검색
+        bar_date_10m = target_date - timedelta(days=1) if session == "US" else target_date
         # 아시아 10M: 6:50, 8:00 M5 두 봉만 합쳐 KTR
         if session == "Asia":
             bars_needed = [(6, 50), (8, 0)]
@@ -305,7 +316,7 @@ def get_ktr_from_mt5(symbol_name: str, session: str, timeframe: str, record_date
                 low_min = min(found[0][1], found[1][1])
                 return round(high_max - low_min, 2), f"{target_date} 06:50+08:00"
             return None, None
-        # 그 외 세션: 기존 2봉(세션 시작 + 5분)
+        # 그 외 세션: 기존 2봉(세션 시작 + 5분). US는 bar_date_10m 사용
         min2 = (minute + 5) % 60
         hour2 = hour if minute < 55 else (hour + 1) % 24
         rates = mt5.copy_rates_from_pos(sym, mt5_m5, 0, count)
@@ -315,7 +326,7 @@ def get_ktr_from_mt5(symbol_name: str, session: str, timeframe: str, record_date
         for i in range(len(rates)):
             bar_ts = int(rates["time"][i])
             bar_dt = mt5_ts_to_kst(bar_ts)
-            if bar_dt.date() != target_date:
+            if bar_dt.date() != bar_date_10m:
                 continue
             if bar_dt.hour == hour and bar_dt.minute == minute:
                 bars_1 = (float(rates["high"][i]), float(rates["low"][i]))
@@ -329,6 +340,10 @@ def get_ktr_from_mt5(symbol_name: str, session: str, timeframe: str, record_date
 
     if timeframe == "1H":
         hour, minute = SESSION_BAR_1H[session][0], SESSION_BAR_1H[session][1]
+        # US 1H: 봉이 전날 23:00에 열리고 당일 00:00에 닫힘 → record_date가 마감일이므로 봉은 전날 날짜로 검색
+        bar_date = target_date
+        if session == "US":
+            bar_date = target_date - timedelta(days=1)
         # 아시아 1H: 08:00 1H 봉 + 10분봉 06:50 봉 합쳐 KTR
         if session == "Asia":
             mt5_h1 = getattr(mt5, "TIMEFRAME_H1", 16385)
@@ -357,7 +372,7 @@ def get_ktr_from_mt5(symbol_name: str, session: str, timeframe: str, record_date
                 low_min = min(h1_low, m10_low)
                 return round(high_max - low_min, 2), f"{target_date} 06:50+08:00 1H"
             return None, None
-        # 그 외 세션: 해당 시각 1시간 구간 5M 봉들 max(High)−min(Low)
+        # 그 외 세션: 해당 시각 1시간 구간 5M 봉들 max(High)−min(Low). US 1H는 bar_date(전날) 기준
         rates = mt5.copy_rates_from_pos(sym, mt5_m5, 0, count)
         if rates is None or len(rates) == 0:
             return None, None
@@ -365,7 +380,7 @@ def get_ktr_from_mt5(symbol_name: str, session: str, timeframe: str, record_date
         for i in range(len(rates)):
             bar_ts = int(rates["time"][i])
             bar_dt = mt5_ts_to_kst(bar_ts)
-            if bar_dt.date() == target_date and bar_dt.hour == hour:
+            if bar_dt.date() == bar_date and bar_dt.hour == hour:
                 hour_highs.append(float(rates["high"][i]))
                 hour_lows.append(float(rates["low"][i]))
         if not hour_highs or not hour_lows:
@@ -384,8 +399,8 @@ def get_mt5_balance() -> float:
     return balance
 
 
-def run_5m(ktr_db_path: str | None = None, session_override: str | None = None, quiet: bool = False) -> None:
-    """session_override가 있으면 해당 세션(Asia/Europe/US)만 측정; 없으면 현재 시각 기준 세션. quiet=True면 텔레그램/과도한 출력 생략."""
+def run_5m(ktr_db_path: str | None = None, session_override: str | None = None, record_date: str | None = None, quiet: bool = False) -> None:
+    """session_override가 있으면 해당 세션(Asia/Europe/US)만 측정; 없으면 현재 시각 기준 세션. record_date 지정 시 해당 날짜로 조회·저장(누락 보충용)."""
     if session_override and session_override in SESSION_BAR_5M:
         target_hour, target_min = SESSION_BAR_5M[session_override][0], SESSION_BAR_5M[session_override][1]
         market_name = session_override
@@ -405,14 +420,14 @@ def run_5m(ktr_db_path: str | None = None, session_override: str | None = None, 
     db_path = ktr_db_path if ktr_db_path else KTR_DB_PATH
     ktr_db = KTRDatabase(db_name=db_path)
 
-    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+    date_str = (record_date or datetime.now(KST).strftime("%Y-%m-%d")).strip()[:10]
     for name, sym in SYMBOLS.items():
-        ktr, bar_time_str = get_ktr_from_mt5(name, market_name, timeframe, record_date=today_str)
+        ktr, bar_time_str = get_ktr_from_mt5(name, market_name, timeframe, record_date=date_str)
         if ktr is not None and bar_time_str:
             if not quiet:
                 print(f"✓ {name}: MT5 기준 {target_hour:02d}:{target_min:02d} 5M 봉 ({bar_time_str}) - KTR : {ktr}")
         else:
-            ktr, bar_time_str = get_ktr_from_pm_db(name, market_name, timeframe, record_date=today_str)
+            ktr, bar_time_str = get_ktr_from_pm_db(name, market_name, timeframe, record_date=date_str)
             if ktr is not None and bar_time_str:
                 if not quiet:
                     print(f"✓ {name}: DB 기준 {target_hour:02d}:{target_min:02d} 5M 봉 ({bar_time_str}) - KTR : {ktr}")
@@ -437,7 +452,6 @@ def run_5m(ktr_db_path: str | None = None, session_override: str | None = None, 
                 print("⚠️ ktrlots 랏수 조회 실패 → KTR만 업로드 (랏수 0)")
             lot_1st, lot_2nd, lot_3rd = 0.0, 0.0, 0.0
 
-        # 랏수 0이어도 KTR은 DB 저장 (record_date = 실행일 KST)
         ktr_db.update_ktr(
             symbol=name,
             session=market_name,
@@ -447,6 +461,7 @@ def run_5m(ktr_db_path: str | None = None, session_override: str | None = None, 
             lot_1st=lot_1st,
             lot_2nd=lot_2nd,
             lot_3rd=lot_3rd,
+            record_date=date_str,
         )
         final_results.append({
             "symbol": name, "ktr": ktr,
@@ -463,8 +478,8 @@ def run_5m(ktr_db_path: str | None = None, session_override: str | None = None, 
     return db_success_count
 
 
-def run_10m(ktr_db_path: str | None = None, session_override: str | None = None, quiet: bool = False):
-    """10M KTR = 세션 시작 10분 구간 1봉(또는 5M 두 봉) High−Low. session_override 시 해당 세션만 측정."""
+def run_10m(ktr_db_path: str | None = None, session_override: str | None = None, record_date: str | None = None, quiet: bool = False):
+    """10M KTR = 세션 시작 10분 구간 1봉(또는 5M 두 봉) High−Low. session_override 시 해당 세션만 측정. record_date 지정 시 누락 보충용."""
     if session_override and session_override in SESSION_BAR_10M:
         target_hour, target_min = SESSION_BAR_10M[session_override][0], SESSION_BAR_10M[session_override][1]
         market_name = session_override
@@ -484,14 +499,14 @@ def run_10m(ktr_db_path: str | None = None, session_override: str | None = None,
     db_path = ktr_db_path if ktr_db_path else KTR_DB_PATH
     ktr_db = KTRDatabase(db_name=db_path)
 
-    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+    date_str = (record_date or datetime.now(KST).strftime("%Y-%m-%d")).strip()[:10]
     for name, sym in SYMBOLS.items():
-        ktr, bar_time_str = get_ktr_from_mt5(name, market_name, timeframe, record_date=today_str)
+        ktr, bar_time_str = get_ktr_from_mt5(name, market_name, timeframe, record_date=date_str)
         if ktr is not None and bar_time_str:
             if not quiet:
                 print(f"✓ {name}: MT5 기준 {target_hour:02d}:{target_min:02d} 10M 봉 ({bar_time_str}) - KTR : {ktr}")
         else:
-            ktr, bar_time_str = get_ktr_from_pm_db(name, market_name, timeframe, record_date=today_str)
+            ktr, bar_time_str = get_ktr_from_pm_db(name, market_name, timeframe, record_date=date_str)
             if ktr is not None and bar_time_str:
                 if not quiet:
                     print(f"✓ {name}: DB 기준 {target_hour:02d}:{target_min:02d} 10M 봉 ({bar_time_str}) - KTR : {ktr}")
@@ -525,6 +540,7 @@ def run_10m(ktr_db_path: str | None = None, session_override: str | None = None,
             lot_1st=lot_1st,
             lot_2nd=lot_2nd,
             lot_3rd=lot_3rd,
+            record_date=date_str,
         )
         final_results.append({
             "symbol": name, "ktr": ktr,
@@ -541,8 +557,8 @@ def run_10m(ktr_db_path: str | None = None, session_override: str | None = None,
     return db_success_count
 
 
-def run_1h(ktr_db_path: str | None = None, session_override: str | None = None, quiet: bool = False):
-    """1H KTR = 세션 시작 1시간 구간 5M 봉들 max(High)−min(Low). 아시아만: 08:00 1H 봉 + 10분봉 06:50 봉 합산. session_override 시 해당 세션만 측정."""
+def run_1h(ktr_db_path: str | None = None, session_override: str | None = None, record_date: str | None = None, quiet: bool = False):
+    """1H KTR = 세션 시작 1시간 구간 5M 봉들 max(High)−min(Low). session_override 시 해당 세션만 측정. record_date 지정 시 누락 보충용."""
     if session_override and session_override in SESSION_BAR_1H:
         target_hour, session_start_min = SESSION_BAR_1H[session_override][0], SESSION_BAR_1H[session_override][1]
         market_name = session_override
@@ -562,14 +578,14 @@ def run_1h(ktr_db_path: str | None = None, session_override: str | None = None, 
     db_path = ktr_db_path if ktr_db_path else KTR_DB_PATH
     ktr_db = KTRDatabase(db_name=db_path)
 
-    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+    date_str = (record_date or datetime.now(KST).strftime("%Y-%m-%d")).strip()[:10]
     for name, sym in SYMBOLS.items():
-        ktr, bar_time_str = get_ktr_from_mt5(name, market_name, timeframe, record_date=today_str)
+        ktr, bar_time_str = get_ktr_from_mt5(name, market_name, timeframe, record_date=date_str)
         if ktr is not None and bar_time_str:
             if not quiet:
                 print(f"✓ {name}: MT5 기준 {target_hour:02d}:{session_start_min:02d} 1H 봉 ({bar_time_str}) - KTR : {ktr}")
         else:
-            ktr, bar_time_str = get_ktr_from_pm_db(name, market_name, timeframe, record_date=today_str)
+            ktr, bar_time_str = get_ktr_from_pm_db(name, market_name, timeframe, record_date=date_str)
             if ktr is not None and bar_time_str:
                 if not quiet:
                     print(f"✓ {name}: DB 기준 {target_hour:02d}:{session_start_min:02d} 1H 봉 ({bar_time_str}) - KTR : {ktr}")
@@ -594,7 +610,6 @@ def run_1h(ktr_db_path: str | None = None, session_override: str | None = None, 
                 print("⚠️ ktrlots 랏수 조회 실패 → KTR만 업로드 (랏수 0)")
             lot_1st, lot_2nd, lot_3rd = 0.0, 0.0, 0.0
 
-        # 랏수 0이어도 KTR은 DB 저장 (record_date = 실행일 KST)
         ktr_db.update_ktr(
             symbol=name,
             session=market_name,
@@ -604,6 +619,7 @@ def run_1h(ktr_db_path: str | None = None, session_override: str | None = None, 
             lot_1st=lot_1st,
             lot_2nd=lot_2nd,
             lot_3rd=lot_3rd,
+            record_date=date_str,
         )
         final_results.append({
             "symbol": name, "ktr": ktr,
@@ -621,36 +637,30 @@ def run_1h(ktr_db_path: str | None = None, session_override: str | None = None, 
 
 
 def run_fill_missing_ktr_for_today(ktr_db_path: str | None = None, quiet: bool = True) -> int:
-    """오늘 날짜 기준으로 KTR 테이블에 누락된 (세션, 타임프레임) 슬롯을 MT5(및 포지션모니터 DB) 봉 데이터로 측정해 자동 입력.
-    현재 시각(KST) 기준 세션만 채움. MT5 우선, 없으면 DB. yfinance 미사용. 반환: 자동 입력한 슬롯 수."""
+    """어제·오늘 누락된 (세션, 타임프레임, 날짜) 슬롯을 MT5(및 포지션모니터 DB) 봉 데이터로 측정해 자동 입력. 반환: 자동 입력한 슬롯 수."""
     try:
         db = KTRDatabase(db_name=ktr_db_path or KTR_DB_PATH)
         today_str = datetime.now(KST).strftime("%Y-%m-%d")
-        missing = db.get_missing_ktr_slots([today_str])
+        yesterday_str = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+        missing = db.get_missing_ktr_slots([yesterday_str, today_str])
         db.conn.close()
     except Exception:
         return 0
     if not missing:
         return 0
-    current_session = get_current_session_kst()
-    # 현재 시각 기준 세션에 해당하는 누락 슬롯만 채움 (다른 세션은 스킵)
-    slots_to_fill = set((s, t) for s, t, _ in missing if s == current_session)
-    if not slots_to_fill and not quiet:
-        print(f"  [KTR] 오늘자 누락은 있으나 현재 세션({current_session})에 해당하는 슬롯 없음 → 스킵", flush=True)
     filled = 0
-    for session, tf in sorted(slots_to_fill):
+    for session, tf, record_date in sorted(missing, key=lambda x: (x[2], x[0], x[1])):
         try:
             if tf == "5M":
-                written = run_5m(ktr_db_path=ktr_db_path, session_override=session, quiet=quiet)
+                written = run_5m(ktr_db_path=ktr_db_path, session_override=session, record_date=record_date, quiet=quiet)
             elif tf == "10M":
-                written = run_10m(ktr_db_path=ktr_db_path, session_override=session, quiet=quiet)
+                written = run_10m(ktr_db_path=ktr_db_path, session_override=session, record_date=record_date, quiet=quiet)
             else:
-                written = run_1h(ktr_db_path=ktr_db_path, session_override=session, quiet=quiet)
-            # 실제로 DB에 1건 이상 썼을 때만 "자동 입력 완료"로 집계 (데이터 없어서 0건이면 filled에 안 넣음)
+                written = run_1h(ktr_db_path=ktr_db_path, session_override=session, record_date=record_date, quiet=quiet)
             if isinstance(written, int) and written > 0:
                 filled += 1
             elif not quiet and (written is None or (isinstance(written, int) and written == 0)):
-                print(f"  [KTR] {session} {tf}: 측정 데이터 없음 → DB 미반영, 수동 입력 필요", flush=True)
+                print(f"  [KTR] {record_date} {session} {tf}: 측정 데이터 없음 → DB 미반영, 수동 입력 필요", flush=True)
         except Exception:
             pass
     return filled

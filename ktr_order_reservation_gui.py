@@ -3428,7 +3428,8 @@ class KTRReservationApp:
         try:
             db = KTRDatabase()
             today_str = datetime.now(KST).strftime("%Y-%m-%d")
-            missing = db.get_missing_ktr_slots([today_str])
+            yesterday_str = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+            missing = db.get_missing_ktr_slots([yesterday_str, today_str])
             db.conn.close()
         except Exception as e:
             self._log(f"KTR 누락 조회 실패: {e}\n", "stderr")

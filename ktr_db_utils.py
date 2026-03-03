@@ -8,6 +8,9 @@ from db_config import UNIFIED_DB_PATH
 KST = pytz.timezone("Asia/Seoul")
 _log = logging.getLogger(__name__)
 
+# 누락 판정 시 두 심볼 모두 있어야 "비누락". 이 심볼명은 ktr_records.symbol 값과 일치해야 함.
+KTR_SLOT_SYMBOLS = ("NAS100", "XAUUSD")
+
 
 class KTRDatabase:
     def __init__(self, db_name=None):
@@ -108,6 +111,27 @@ class KTRDatabase:
         )
         return cur.fetchone() is not None
 
+    def has_both_symbols_for_slot(self, session: str, timeframe: str, record_date: str) -> bool:
+        """해당 (세션, 타임프레임, 측정일)에 NAS100·XAUUSD 두 심볼 모두 레코드가 있으면 True. 누락 판정용."""
+        try:
+            from supabase_sync import has_both_ktr_symbols_for_slot_supabase, SUPABASE_SYNC_ENABLED
+            if SUPABASE_SYNC_ENABLED:
+                return has_both_ktr_symbols_for_slot_supabase(session, timeframe, record_date)
+        except Exception:
+            pass
+        if not record_date or not isinstance(record_date, str):
+            return False
+        rd = record_date.strip()[:10]
+        cur = self.conn.execute(
+            """SELECT symbol FROM ktr_records
+               WHERE session=? AND timeframe=?
+               AND (record_date = ? OR (record_date IS NOT NULL AND date(record_date) = date(?))
+                    OR (record_date IS NULL AND date(created_at) = date(?)))""",
+            (session, timeframe, rd, rd, rd),
+        )
+        found = {row[0] for row in cur.fetchall() if row and row[0]}
+        return all(s in found for s in KTR_SLOT_SYMBOLS)
+
     def get_latest_ktr(self, symbol, session, timeframe):
         """Supabase 우선 조회."""
         try:
@@ -194,7 +218,8 @@ class KTRDatabase:
             for session, timeframe in slots:
                 if not self._slot_measurement_past(session, timeframe, record_date, now_kst):
                     continue
-                if not self.has_ktr_for_session_timeframe_date(session, timeframe, record_date):
+                # 두 심볼(NAS100, XAUUSD) 모두 있어야 비누락. 하나라도 없으면 누락으로 표시
+                if not self.has_both_symbols_for_slot(session, timeframe, record_date):
                     missing.append((session, timeframe, record_date))
         return missing
 
@@ -207,7 +232,7 @@ class KTRDatabase:
         # 각 세션별 "이 시각 이후면 측정 가능" (KST 기준)
         # Asia: 8:00 5M→8:05, 10M→8:10, 1H→9:00
         # Europe: 17:00 5M→17:05, 10M→17:10, 1H→18:00
-        # US: 23:30 5M→23:35, 10M→23:40, 1H→다음날 00:00
+        # US: 23:30 5M→23:35, 10M→23:40, 1H→당일 00:00 (record_date가 봉 마감일이므로 같은 날 00:00에 측정됨)
         if session == "Asia":
             if timeframe == "5M":
                 t = time(8, 5)
@@ -230,7 +255,7 @@ class KTRDatabase:
             elif timeframe == "10M":
                 t = time(23, 40)
             else:
-                d = d + timedelta(days=1)
+                # US 1H: record_date = 봉 마감일(00:00 해당일) → 측정 시각은 당일 00:00
                 t = time(0, 0)
             cutoff = KST.localize(datetime.combine(d, t))
         if now_kst.tzinfo is None:

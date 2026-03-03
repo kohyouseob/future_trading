@@ -1576,6 +1576,32 @@ def close_all_and_reenter_if_profit_over_pct(threshold_pct: float = PROFIT_TAKE_
         side = "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL"
         key = (sym, side)
         reentry_plan[key] = reentry_plan.get(key, 0.0) + p.volume
+
+    # 청산·취소 전에 대기 중인 KTR 예약 정보 수집 (재진입 후 동일 구조로 복원용)
+    ktr_restore: dict = {}  # (symbol, side) -> (step_ktr, [(volume, order_index_1based), ...])
+    orders_before = mt5.orders_get() or []
+    ktr_pending_before = [o for o in orders_before if getattr(o, "magic", 0) == MAGIC_KTR]
+    for (symbol, side) in reentry_plan.keys():
+        pos_same = [p for p in positions if p.symbol == symbol and (side == "BUY" and p.type == mt5.ORDER_TYPE_BUY or side == "SELL" and p.type == mt5.ORDER_TYPE_SELL)]
+        if not pos_same:
+            continue
+        entry_old = sum(p.price_open for p in pos_same) / len(pos_same)
+        is_buy = side == "BUY"
+        ot_limit = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
+        same_orders = [o for o in ktr_pending_before if o.symbol == symbol and getattr(o, "type", 0) == ot_limit]
+        if not same_orders:
+            continue
+        # 가격 순: 매수는 진입가에 가까운 것(가격 높은 것) 먼저, 매도는 진입가에 가까운 것(가격 낮은 것) 먼저
+        same_orders.sort(key=lambda o: getattr(o, "price_open", 0) or getattr(o, "price_current", 0), reverse=is_buy)
+        first_price = getattr(same_orders[0], "price_open", None) or getattr(same_orders[0], "price_current", 0)
+        if first_price is None:
+            continue
+        step = (entry_old - float(first_price)) if is_buy else (float(first_price) - entry_old)
+        if step <= 0:
+            continue
+        order_list = [(getattr(o, "volume_current", 0) or getattr(o, "volume", 0), i + 1) for i, o in enumerate(same_orders)]
+        ktr_restore[(symbol, side)] = (step, order_list)
+
     # 전 포지션 청산
     closed_all: List[dict] = []
     symbols = list({p.symbol for p in positions})
@@ -1605,6 +1631,43 @@ def close_all_and_reenter_if_profit_over_pct(threshold_pct: float = PROFIT_TAKE_
         else:
             reentry_fail.append((symbol, side, vol_rounded, msg or "실패"))
             print(f"  ❌ [수익실현 재진입 실패] {symbol} {side} {vol_rounded}랏: {msg}")
+
+    # 재진입 성공한 (symbol, side) 중 대기했던 KTR 예약이 있으면 재진입가 기준으로 KTR 예약 재생성
+    for rec in reentry_ok:
+        symbol = rec.get("symbol")
+        side = rec.get("type")
+        if not symbol or not side:
+            continue
+        key = (symbol, side)
+        if key not in ktr_restore:
+            continue
+        step, order_list = ktr_restore[key]
+        new_pos = mt5.positions_get(symbol=symbol) or []
+        new_pos = [p for p in new_pos if (side == "BUY" and p.type == mt5.ORDER_TYPE_BUY) or (side == "SELL" and p.type == mt5.ORDER_TYPE_SELL)]
+        if not new_pos:
+            continue
+        new_entry = sum(p.price_open for p in new_pos) / len(new_pos)
+        is_buy = side == "BUY"
+        num_positions = len(order_list) + 1
+        placed = 0
+        for vol, idx in order_list:
+            if vol <= 0:
+                continue
+            limit_price = (new_entry - step * idx) if is_buy else (new_entry + step * idx)
+            mult_j = num_positions - idx - 0.5
+            sl = (limit_price - mult_j * step) if is_buy else (limit_price + mult_j * step)
+            comment = f"PTKTR{idx + 1}"[:31]
+            ok, msg = tr.place_pending_limit(symbol, side, vol, limit_price, sl=sl, tp=0.0, magic=MAGIC_KTR, comment=comment)
+            if ok:
+                placed += 1
+                print(f"  [수익실현 KTR 복원] {symbol} {side} {idx + 1}차 예약 {vol}랏 @ {limit_price:.2f}")
+            else:
+                print(f"  [수익실현 KTR 복원 실패] {symbol} {side} {idx + 1}차: {msg}")
+            if len(order_list) > 1:
+                time.sleep(0.4)
+        if placed:
+            print(f"  [수익실현 KTR 복원] {symbol} {side} 예약 {placed}건 생성 (재진입가 {new_entry:.2f} 기준)", flush=True)
+
     return (closed_all, profit_rate_pct, reentry_ok, reentry_fail)
 
 
@@ -2773,8 +2836,9 @@ def main() -> None:
     # 꺼져 있던 동안 못 쌓인 과거 24시간 봉을 bar 테이블에 바로 보충
     print("  [시작] 24시간 봉 보충 중...", flush=True)
     _run_startup_bar_backfill_24h()
-    print("  [시작] 24시간 봉 보충 완료. 정상 점검 루프 진입.", flush=True)
-    # 시작 시 KTR 테이블 누락 슬롯 확인 후 로그 출력 (수동 입력은 GUI에서)
+    print("  [시작] 24시간 봉 보충 완료.", flush=True)
+    # 시작 시 KTR 테이블 누락 슬롯 확인 및 자동 보충
+    print("  [KTR] 누락 점검 중...", flush=True)
     try:
         from ktr_db_utils import KTRDatabase
         db = KTRDatabase(db_name=KTR_DB_PATH)
@@ -2783,14 +2847,15 @@ def main() -> None:
         yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         missing = db.get_missing_ktr_slots([today_str, yesterday_str])
         db.conn.close()
-        # 오늘자 누락이 있으면 자동 측정(MT5/DB)으로 입력 시도
-        today_missing = [(s, t, d) for s, t, d in missing if d == today_str]
-        if today_missing:
+        # 누락이 있으면 어제·오늘 모두 자동 측정(MT5/DB)으로 입력 시도
+        if missing:
             try:
                 from ktr_measure_calculator import run_fill_missing_ktr_for_today
                 filled = run_fill_missing_ktr_for_today(ktr_db_path=KTR_DB_PATH, quiet=True)
                 if filled > 0:
-                    print(f"  [KTR] 오늘자 누락 {filled}개 슬롯 자동 입력 완료.", flush=True)
+                    print(f"  [KTR] 누락 {filled}개 슬롯 자동 입력 완료.", flush=True)
+                else:
+                    print(f"  [KTR] 누락 {len(missing)}건 자동 입력 시도했으나 측정 데이터 없음 0건.", flush=True)
             except Exception as e:
                 print(f"  [KTR] 자동 입력 실패: {e}", flush=True)
             # 재조회
@@ -2802,9 +2867,19 @@ def main() -> None:
             if len(missing) > 5:
                 summary += f" 외 {len(missing) - 5}건"
             print(f"  [KTR] 누락 {len(missing)}건: {summary}. 수동 입력은 KTR 예약 GUI에서 진행하세요.", flush=True)
-            print(f"  [KTR] 조회 DB: {KTR_DB_PATH}", flush=True)
+            try:
+                from supabase_sync import SUPABASE_SYNC_ENABLED
+                if SUPABASE_SYNC_ENABLED:
+                    print("  [KTR] 조회: Supabase(주) + 로컬 백업", flush=True)
+                else:
+                    print(f"  [KTR] 조회 DB: {KTR_DB_PATH}", flush=True)
+            except Exception:
+                print(f"  [KTR] 조회 DB: {KTR_DB_PATH}", flush=True)
+        else:
+            print("  [KTR] 누락 없음.", flush=True)
     except Exception as e:
         print(f"  [KTR] 누락 조회 생략: {e}", flush=True)
+    print("  [시작] 정상 점검 루프 진입.", flush=True)
     loop_count = 0
     while True:
         try:
