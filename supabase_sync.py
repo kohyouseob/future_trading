@@ -53,7 +53,13 @@ def _post_upsert(table: str, payload: Any, on_conflict: str) -> bool:
             _log.info("Supabase 업데이트 성공: %s %d건", table, count)
             return True
         reason = (resp.text or resp.reason or str(resp.status_code))[:500]
-        _log.warning("Supabase 업데이트 실패: %s - status=%s, 원인: %s", table, resp.status_code, reason)
+        if resp.status_code == 404 or "PGRST205" in reason or "Could not find the table" in reason:
+            _log.warning(
+                "Supabase 테이블 없음(404): %s → 로컬만 사용. 테이블 생성: Supabase Dashboard → SQL Editor에서 supabase_migration_position_status_sent.sql 내용 실행.",
+                table,
+            )
+        else:
+            _log.warning("Supabase 업데이트 실패: %s - status=%s, 원인: %s", table, resp.status_code, reason)
         return False
     except Exception as e:
         _log.warning("Supabase 업데이트 실패: %s - 예외: %s", table, e)

@@ -383,6 +383,99 @@ BB_OFFSET_SYMBOLS = ("XAUUSD+", "NAS100+")
 DEFAULT_BB_OFFSET_PCT: Dict[str, float] = {"XAUUSD+": 0.5, "NAS100+": 2.5}
 # 실시간 오더에서 T/P를 수동 업데이트한 티켓 목록. 포지션 모니터는 이 티켓에 20B T/P를 넣지 않음.
 REALTIME_TP_TICKETS_PATH = os.path.normpath(os.path.join(_SCRIPT_DIR, "position_monitor_realtime_tp_tickets.json"))
+# 트레일링 스탑 적용 티켓 (이익 50% 보전용 S/L 캔들가 따라 갱신)
+REALTIME_TRAILING_STOP_TICKETS_PATH = os.path.normpath(os.path.join(_SCRIPT_DIR, "position_monitor_realtime_trailing_stop_tickets.json"))
+
+
+def _load_trailing_stop_tickets() -> List[int]:
+    """트레일링 스탑 적용 중인 티켓 목록 로드."""
+    if not os.path.isfile(REALTIME_TRAILING_STOP_TICKETS_PATH):
+        return []
+    try:
+        with open(REALTIME_TRAILING_STOP_TICKETS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [int(x) for x in (data if isinstance(data, list) else []) if isinstance(x, (int, float))]
+    except Exception:
+        return []
+
+
+def _save_trailing_stop_tickets(tickets: List[int]) -> None:
+    """트레일링 스탑 티켓 목록 저장."""
+    try:
+        with open(REALTIME_TRAILING_STOP_TICKETS_PATH, "w", encoding="utf-8") as f:
+            json.dump(list(tickets), f)
+    except Exception:
+        pass
+
+
+def _add_trailing_stop_ticket(ticket: int) -> None:
+    """실시간 오더 진입 시 트레일링 스탑 체크된 경우 티켓 등록."""
+    tickets = _load_trailing_stop_tickets()
+    if ticket not in tickets:
+        tickets.append(ticket)
+        _save_trailing_stop_tickets(tickets)
+
+
+def _get_last_closed_candle_close(symbol: str, mt5_tf: int = None) -> Optional[float]:
+    """해당 심볼·타임프레임 직전 마감 봉 종가. 10M 기본."""
+    if mt5_tf is None:
+        mt5_tf = getattr(mt5, "TIMEFRAME_M10", 10)
+    rates = get_rates_for_timeframe(symbol, mt5_tf, count=5)
+    if rates is None or len(rates) < 2:
+        return None
+    return float(rates["close"][1])
+
+
+def _update_trailing_stop_50pct(log_fn) -> None:
+    """트레일링 스탑 등록 티켓에 대해 캔들가(10M 직전 봉 종가) 기준 이익 50% 보전 S/L 갱신."""
+    tickets = _load_trailing_stop_tickets()
+    if not tickets:
+        return
+    if not tr.init_mt5():
+        return
+    still_active = []
+    m10 = getattr(mt5, "TIMEFRAME_M10", 10)
+    for ticket in tickets:
+        pos = mt5.positions_get(ticket=ticket)
+        if not pos or len(pos) == 0:
+            continue
+        pos = pos[0]
+        still_active.append(ticket)
+        sym = getattr(pos, "symbol", "")
+        if not sym:
+            continue
+        entry = float(getattr(pos, "price_open", 0) or 0)
+        current_sl = getattr(pos, "sl", 0) or 0
+        current_tp = getattr(pos, "tp", 0) or 0
+        is_buy = pos.type == mt5.ORDER_TYPE_BUY
+        price = _get_last_closed_candle_close(sym, m10)
+        if price is None:
+            ask, bid = tr.get_market_price(sym) if hasattr(tr, "get_market_price") else (None, None)
+            price = (ask if is_buy else bid) if (ask is not None or bid is not None) else None
+        if price is None:
+            continue
+        if is_buy:
+            profit = price - entry
+            if profit <= 0:
+                continue
+            new_sl = entry + 0.5 * profit
+            if new_sl <= entry or (current_sl > 0 and new_sl <= current_sl):
+                continue
+            if new_sl >= price:
+                continue
+        else:
+            profit = entry - price
+            if profit <= 0:
+                continue
+            new_sl = entry - 0.5 * profit
+            if new_sl >= entry or (current_sl > 0 and new_sl >= current_sl):
+                continue
+            if new_sl <= price:
+                continue
+        ok, msg = tr.modify_position_sltp(ticket, sym, new_sl, current_tp)
+        if ok:
+            log_fn(f"  [트레일링 스탑] #{ticket} {sym} S/L 갱신 → {new_sl:.5g} (이익 50% 보전)")
+    _save_trailing_stop_tickets(still_active)
 
 
 def _add_realtime_tp_ticket(ticket: int) -> None:
@@ -1635,6 +1728,7 @@ def _execute_ktr_entry(
     tp_ktr_multiplier: Optional[float] = None,
     tf_label: Optional[str] = None,
     use_other_positions_sltp: bool = False,
+    ktr_multiplier: float = 1.0,
 ) -> Tuple[bool, Optional[float], Optional[float]]:
     """KTR 1차 시장가 + 2~N차 예약 주문 실행. 반환: (성공 여부, 진입가, 1차 랏수). weight_pct<=0 이면 마진레벨 500%까지 최대 비중 자동 계산."""
     log_fn("--- KTR 진입 시작 ---")
@@ -1670,6 +1764,9 @@ def _execute_ktr_entry(
     if tf_used != tf:
         log_fn(f"⚠️ {tf} KTR 없음 → {tf_used} KTR 사용: {ktr_value} pt")
     log_fn(f"KTR 값: {ktr_value} pt ({session_used})")
+    if ktr_multiplier != 1.0:
+        ktr_value = ktr_value * ktr_multiplier
+        log_fn(f"KTR 배수 적용: ×{ktr_multiplier} → {ktr_value} pt")
 
     if not tr.init_mt5():
         log_fn("❌ 오더 미실행 사유: MT5 연결 실패. 터미널 실행 및 로그인 확인.")
@@ -1860,11 +1957,12 @@ def _execute_ktr_entry(
             mult_j = 1.5
         else:
             mult_j = num_positions - j + 0.5
-        sl_j = (entry - mult_j * ktr_price) if is_buy else (entry + mult_j * ktr_price)
+        # 손절 = 해당 포지션 체결가(limit_price) 기준 - mult_j KTR (1차는 시장가 기준 (N-0.5)KTR)
+        sl_j = (limit_price - mult_j * ktr_price) if is_buy else (limit_price + mult_j * ktr_price)
         pending_comment = _build_order_comment(
             f"KTR{i+1}", resolved_session, tf_for_comment, tp_option, sl_option, sl_from_n
         )
-        log_fn(f"{ordinals[i]} 예약 주문 요청: {lot}랏 @ {limit_price:.2f} S/L={sl_j:.5g} (KTR×{i} {'아래' if is_buy else '위'})")
+        log_fn(f"{ordinals[i]} 예약 주문 요청: {lot}랏 @ {limit_price:.2f} S/L={sl_j:.5g} (체결가 기준 -{mult_j} KTR)")
         ok, msg = tr.place_pending_limit(
             symbol, side, lot, limit_price, sl=sl_j, tp=0.0, magic=MAGIC_KTR, comment=pending_comment
         )
@@ -2175,7 +2273,7 @@ class KTRReservationApp:
         self.var_weight = tk.StringVar(value="1%")
         weight_f = ttk.Frame(left_f)
         weight_f.grid(row=row, column=1, sticky=tk.W, pady=2)
-        for val in ("1%", "2.5%"):
+        for val in ("1%", "2.5%", "5%", "10%"):
             ttk.Radiobutton(
                 weight_f, text=val, variable=self.var_weight, value=val
             ).pack(side=tk.LEFT, padx=(0, 12))
@@ -2203,8 +2301,12 @@ class KTRReservationApp:
         row += 1
 
         ttk.Label(left_f, text="KTR 값 (선택)").grid(row=row, column=0, sticky=tk.W, pady=2)
-        self.lbl_res_ktr = ttk.Label(left_f, text="—", font=("", 10, "bold"))
-        self.lbl_res_ktr.grid(row=row, column=1, sticky=tk.W, pady=2)
+        res_ktr_f = ttk.Frame(left_f)
+        res_ktr_f.grid(row=row, column=1, sticky=tk.W, pady=2)
+        self.lbl_res_ktr = ttk.Label(res_ktr_f, text="—", font=("", 10, "bold"))
+        self.lbl_res_ktr.pack(side=tk.LEFT)
+        self.var_res_ktr_x2 = tk.BooleanVar(value=False)
+        ttk.Checkbutton(res_ktr_f, text="KTR X2", variable=self.var_res_ktr_x2, command=self._refresh_res_ktr).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Label(left_f, text="KTR 세션").grid(row=row, column=2, sticky=tk.W, padx=(24, 0), pady=2)
         self.var_session = tk.StringVar(value="자동")
         session_f = ttk.Frame(left_f)
@@ -2367,7 +2469,9 @@ class KTRReservationApp:
         ttk.Checkbutton(entry_tf_rt, text="10분봉 4B/20B 자동오더", variable=self.var_rt_m10_bb_auto).pack(side=tk.LEFT, padx=(0, 8))
         self.var_rt_m10_bb_weight = tk.StringVar(value="1%")
         ttk.Radiobutton(entry_tf_rt, text="1%", variable=self.var_rt_m10_bb_weight, value="1%").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Radiobutton(entry_tf_rt, text="2.5%", variable=self.var_rt_m10_bb_weight, value="2.5%").pack(side=tk.LEFT)
+        ttk.Radiobutton(entry_tf_rt, text="2.5%", variable=self.var_rt_m10_bb_weight, value="2.5%").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Radiobutton(entry_tf_rt, text="5%", variable=self.var_rt_m10_bb_weight, value="5%").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Radiobutton(entry_tf_rt, text="10%", variable=self.var_rt_m10_bb_weight, value="10%").pack(side=tk.LEFT)
         r += 1
         ttk.Label(rt_f, text="진입 조건").grid(row=r, column=0, sticky=tk.W, pady=2)
         self.var_rt_entry_condition = tk.StringVar(value="돌파더블비")
@@ -2382,7 +2486,7 @@ class KTRReservationApp:
         self.var_rt_weight = tk.StringVar(value="1%")
         w_rt = ttk.Frame(rt_f)
         w_rt.grid(row=r, column=1, sticky=tk.W, pady=2)
-        for val in ("1%", "2.5%"):
+        for val in ("1%", "2.5%", "5%", "10%"):
             ttk.Radiobutton(w_rt, text=val, variable=self.var_rt_weight, value=val).pack(side=tk.LEFT, padx=(0, 12))
         r += 1
         ttk.Label(rt_f, text="N값").grid(row=r, column=0, sticky=tk.W, pady=2)
@@ -2411,8 +2515,12 @@ class KTRReservationApp:
         ttk.Radiobutton(sess_rt, text="2", variable=self.var_rt_add_ktr_mult, value="2").pack(side=tk.LEFT, padx=(0, 0))
         r += 1
         ttk.Label(rt_f, text="KTR 값 (선택)").grid(row=r, column=0, sticky=tk.W, pady=2)
-        self.lbl_rt_ktr = ttk.Label(rt_f, text="—", font=("", 10, "bold"))
-        self.lbl_rt_ktr.grid(row=r, column=1, sticky=tk.W, pady=2)
+        rt_ktr_f = ttk.Frame(rt_f)
+        rt_ktr_f.grid(row=r, column=1, sticky=tk.W, pady=2)
+        self.lbl_rt_ktr = ttk.Label(rt_ktr_f, text="—", font=("", 10, "bold"))
+        self.lbl_rt_ktr.pack(side=tk.LEFT)
+        self.var_rt_ktr_x2 = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rt_ktr_f, text="KTR X2", variable=self.var_rt_ktr_x2, command=self._refresh_rt_ktr).pack(side=tk.LEFT, padx=(12, 0))
         r += 1
         ttk.Label(rt_f, text="차익실현 (KTR 기준)").grid(row=r, column=0, sticky=tk.W, pady=2)
         self.var_rt_tp_ktr = tk.StringVar(value="1")
@@ -2450,6 +2558,8 @@ class KTRReservationApp:
         ttk.Button(btn_rt, text="목록 새로고침", command=self._refresh_rt_positions).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_rt, text="T/P 업데이트", command=self._on_update_selected_position_tp).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_rt, text="포지션 SL/TP 수정…", command=self._open_sltp_editor).pack(side=tk.LEFT)
+        self.var_rt_trailing_stop = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btn_rt, text="트레일링 스탑 (이익 50% 보전)", variable=self.var_rt_trailing_stop).pack(side=tk.LEFT, padx=(12, 0))
         r += 1
         self.var_rt_tp = tk.StringVar(value="사용하지 않음")
         self.var_rt_sl = tk.StringVar(value="사용하지 않음")
@@ -2619,6 +2729,13 @@ class KTRReservationApp:
                 risk = 10.0
             num_positions_override = None
         n_str = self.var_rt_n.get().strip()
+        # 비중 5%, 10%는 N값 없음으로 진입 불가
+        if weight_s in ("5", "10") and n_str == "없음":
+            messagebox.showwarning(
+                "비중 / N값",
+                "비중 5%, 10%는 N값 없음으로 오더를 생성할 수 없습니다.\nN값(1.5, 2.5, 3.5, 4.5 중 하나)을 선택하세요.",
+            )
+            return
         if n_str == "없음":
             num_positions = 1
             n_for_ktrlots = 1.0
@@ -2682,6 +2799,13 @@ class KTRReservationApp:
             m10_bb_weight_pct = float(m10_bb_weight_s) if m10_bb_weight_s else 1.0
         except ValueError:
             m10_bb_weight_pct = 1.0
+        # M10 BB 자동 추가 비중 5%, 10%는 N값 없음으로 예약 생성 불가
+        if add_m10_bb_auto and m10_bb_weight_s in ("5", "10") and n_str == "없음":
+            messagebox.showwarning(
+                "비중 / N값",
+                "비중 5%, 10%는 N값 없음으로 오더를 생성할 수 없습니다.\nM10 BB 자동 추가를 쓰려면 N값을 선택하거나, 비중을 1%/2.5%로 설정하세요.",
+            )
+            add_m10_bb_auto = False
         # 시스템 주문(10분봉 4B/20B 자동오더)은 매시 정시~10분에만 입력 가능
         if add_m10_bb_auto and not _is_system_order_time_window_kst():
             messagebox.showwarning(
@@ -2710,6 +2834,8 @@ class KTRReservationApp:
             "add_m10_bb_auto": add_m10_bb_auto,
             "m10_bb_weight_pct": m10_bb_weight_pct,
             "use_other_positions_sltp": (n_str == "없음"),
+            "trailing_stop": bool(getattr(self, "var_rt_trailing_stop", None) and self.var_rt_trailing_stop.get()),
+            "ktr_x2": bool(getattr(self, "var_rt_ktr_x2", None) and self.var_rt_ktr_x2.get()),
         }
 
         scheduled_str = self.var_rt_scheduled_time.get().strip()
@@ -2823,6 +2949,7 @@ class KTRReservationApp:
                 tp_ktr_multiplier=tp_ktr_multiplier,
                 tf_label=entry_tf_label,
                 use_other_positions_sltp=bool(params.get("use_other_positions_sltp", False)),
+                ktr_multiplier=2.0 if params.get("ktr_x2") else 1.0,
             )
         except Exception as e:
             import traceback
@@ -2834,6 +2961,16 @@ class KTRReservationApp:
         if ok:
             self._log("실시간 진입 절차 완료.")
             telegram_lines.insert(3, "✅ 실행 결과: 성공")
+            if params.get("trailing_stop"):
+                sym_clean = (symbol or "").rstrip("+")
+                positions = mt5.positions_get(symbol=symbol) or []
+                if not positions and sym_clean:
+                    positions = mt5.positions_get(symbol=sym_clean) or []
+                ktr_pos = [p for p in positions if getattr(p, "magic", 0) == MAGIC_KTR]
+                if ktr_pos:
+                    latest = max(ktr_pos, key=lambda p: getattr(p, "time", 0))
+                    _add_trailing_stop_ticket(latest.ticket)
+                    self._log(f"  [트레일링 스탑] 1차 포지션 #{latest.ticket} 등록 (캔들가 기준 이익 50%% S/L 갱신)")
             # +KTR 체크 시 예약 오더 없이 즉시 시장가+KTR 1건 실행 (시장가 체결 후 N×KTR S/L·T/P 설정). 실패 시 로그만 남김.
             # 진입수>=2(1차 시장가+2차 예약)인 경우 +KTR 추가 시장가는 생략 → 동일가(24829) 시장가 중복 방지
             add_ktr = params.get("add_ktr", False)
@@ -2853,7 +2990,8 @@ class KTRReservationApp:
                     if not ktr_value or ktr_value <= 0:
                         self._log(f"  +KTR 미실행: 해당 심볼/세션/타임프레임 KTR 값 없음 ({symbol} / {session} / {tf}). KTR 탭에서 입력 후 재시도.")
                     else:
-                        ktr_f = float(ktr_value)
+                        ktr_mult = 2.0 if params.get("ktr_x2") else 1.0
+                        ktr_f = float(ktr_value) * ktr_mult
                         entry_tf = (params.get("entry_tf_label") or "").strip()
                         tp_ktr = params.get("tp_ktr_multiplier")
                         is_buy = (side or "").strip().upper() == "BUY"
@@ -3059,6 +3197,13 @@ class KTRReservationApp:
                 risk = 10.0
             num_positions_override = None
         n_str = self.var_n.get().strip()
+        # 비중 5%, 10%는 N값 없음으로 오더 생성 불가
+        if weight_s in ("5", "10") and n_str == "없음":
+            messagebox.showwarning(
+                "비중 / N값",
+                "비중 5%, 10%는 N값 없음으로 오더를 생성할 수 없습니다.\nN값(1.5, 2.5, 3.5, 4.5 중 하나)을 선택하세요.",
+            )
+            return
         # 기본더블비는 N값 2.5 이상 또는 '없음'만 허용 (N=1.5 오더 생성 차단)
         if "기본더블비" in conditions and n_str == "1.5":
             messagebox.showwarning(
@@ -3105,6 +3250,7 @@ class KTRReservationApp:
             "sl_from_n": True,
             "session": self.var_session.get().strip(),
             "ktr_tf": self.var_ktr_tf.get().strip(),
+            "ktr_x2": bool(getattr(self, "var_res_ktr_x2", None) and self.var_res_ktr_x2.get()),
             "tp_option": self.var_tp.get().strip(),
             "sl_option": self.var_sl.get().strip(),
             "active": True,
@@ -3181,7 +3327,7 @@ class KTRReservationApp:
             weight_str = "최대"
         else:
             weight_str = f"{int(w)}%" if isinstance(w, (int, float)) and w == int(w) else f"{w}%"
-        if weight_str not in ("1%", "2.5%", "5%", "전저점"):
+        if weight_str not in ("1%", "2.5%", "5%", "10%", "전저점"):
             weight_str = "1%"
         self.var_weight.set(weight_str)
         n_disp = r.get("n_display", str(r.get("n_value", "2.5")))
@@ -3193,6 +3339,8 @@ class KTRReservationApp:
         self.var_session.set("자동")
         ktr_tf = (r.get("ktr_tf") or "10M").strip().upper()
         self.var_ktr_tf.set(ktr_tf if ktr_tf in ("10M", "1H") else "10M")
+        if getattr(self, "var_res_ktr_x2", None) is not None:
+            self.var_res_ktr_x2.set(bool(r.get("ktr_x2", False)))
         self._refresh_res_ktr()
         # 차익실현/손절 설정 기능 제거 → 수정 시에도 사용하지 않음으로 유지
         self.var_tp.set("사용하지 않음")
@@ -3711,6 +3859,15 @@ class KTRReservationApp:
                                 if it in self._realtime_ktr_retrace_list:
                                     self._realtime_ktr_retrace_list.remove(it)
 
+                # 트레일링 스탑: 등록된 티켓에 대해 10분봉 캔들가 기준 이익 50% 보전 S/L 갱신
+                if now_kst.hour != 7 and tr.init_mt5():
+                    def _trailing_log_fn(msg):
+                        try:
+                            self.root.after(0, lambda m=msg: self._log(m))
+                        except Exception:
+                            pass
+                    _update_trailing_stop_50pct(_trailing_log_fn)
+
                 # [우선 실행] 예약 오더 진입 점검·실행 — 해당 타임프레임 봉 마감 시점에만 점검·진입
                 reservation_check_log_lines = []  # 미충족 시 텔레그램 전송용 (맨 윗줄 "[예약 체크]"는 전송 시에만 추가)
                 if now_kst.hour != 7:
@@ -4078,6 +4235,7 @@ class KTRReservationApp:
             entry_conditions=res.get("conditions", []),
             source="reservation",
             tf_label=(res.get("timeframe_label") or "").strip(),
+            ktr_multiplier=2.0 if res.get("ktr_x2") else 1.0,
         )
         if ok:
             _save_execution_1h_bar(symbol, bar_key)

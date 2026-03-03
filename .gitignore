@@ -7,3 +7,4 @@ Others/
 docs/
 position_status_sentinel/
 scheduler.db
+*.lock
