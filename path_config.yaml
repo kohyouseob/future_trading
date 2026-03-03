@@ -1,0 +1,8 @@
+# 경로 환경 설정 (다른 PC에서 실행 시 이 파일만 수정하세요)
+# - mt5_path: MetaTrader 5 terminal64.exe 경로
+# - mt5_terminal_data_folder: (선택) MT5 터미널 데이터 폴더
+# - db_path: (선택) 비우면 v2/scheduler.db 사용
+
+mt5_path: "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+mt5_terminal_data_folder: ""
+db_path: ""

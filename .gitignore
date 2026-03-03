@@ -1,0 +1,8 @@
+# 민감 정보 제외
+.env
+__pycache__/
+*.log
+Others/
+.telegram_bar_sent/
+docs/
+position_status_sentinel/

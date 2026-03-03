@@ -1,0 +1,44 @@
+[
+  {
+    "id": "20260302191701_NAS100+",
+    "symbol": "NAS100+",
+    "side": "BUY",
+    "timeframe_label": "1시간봉",
+    "mt5_timeframe": 16385,
+    "conditions": [
+      "기본더블비"
+    ],
+    "weight_pct": 2.5,
+    "n_value": 4.5,
+    "n_display": "4.5",
+    "num_positions": 5,
+    "sl_from_n": true,
+    "session": "자동",
+    "ktr_tf": "5M",
+    "tp_option": "사용하지 않음",
+    "sl_option": "사용하지 않음",
+    "active": true,
+    "created_at": "2026-03-02T19:17:01.332246"
+  },
+  {
+    "id": "20260302191705_XAUUSD+",
+    "symbol": "XAUUSD+",
+    "side": "BUY",
+    "timeframe_label": "1시간봉",
+    "mt5_timeframe": 16385,
+    "conditions": [
+      "기본더블비"
+    ],
+    "weight_pct": 2.5,
+    "n_value": 4.5,
+    "n_display": "4.5",
+    "num_positions": 5,
+    "sl_from_n": true,
+    "session": "자동",
+    "ktr_tf": "5M",
+    "tp_option": "사용하지 않음",
+    "sl_option": "사용하지 않음",
+    "active": true,
+    "created_at": "2026-03-02T19:17:05.750161"
+  }
+]

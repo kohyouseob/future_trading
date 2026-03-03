@@ -1,0 +1,51 @@
+# v2 매매 프로그램 설정 (설정 외부화)
+# 수정 후 프로그램 재시작 시 반영됨
+
+# --- 포지션 모니터 ---
+position_monitor:
+  check_interval_sec: 300      # 전체 점검 주기 (초). 기본 5분
+  db_update_interval_sec: 60   # DB 캔들 갱신 주기 (초)
+  # MT5 경로는 path_config.yaml 에서 설정 (다른 PC에서는 그 파일만 수정)
+  # mt5_path 없음 → path_config.yaml 의 mt5_path 사용
+  # 청산 조건 on/off (true면 해당 조건으로 청산 수행)
+  exit_conditions:
+    bb20_upper_touch: true     # 20B 상단 터치
+    sma4_wick_rejection: true  # 4이평 윗꼬리
+    three_bars_resistance: true
+    doji_upper_wick: true
+    m10_bb20_upper_wick: true
+    levels_rejection: true     # 20/120이평, BB4/20 상단 되튐
+
+# --- 예약 오더 모니터 ---
+reservation_monitor:
+  poll_interval_sec: 60       # 모니터 루프 주기 (초). 봉 마감 시점에만 조건 점검
+  margin_level_min_pct: 200    # 이 값 초과일 때만 주문 실행
+  execution_1h_bar_path: "ktr_execution_1h_bar.json"
+  reservations_path: "ktr_reservations.json"
+
+# --- 리스크 상한 (일일/주간 제한) ---
+risk_limits:
+  enabled: true
+  daily_max_loss_pct: 5.0      # 일일 누적 손실이 계정 대비 이 비율 초과 시 신규 진입 중단
+  daily_max_entries: 10        # 일일 최대 진입 횟수 (예약 실행 기준)
+  symbol_max_positions: 1      # 심볼당 동시 보유 포지션 최대 (1 권장)
+  weekly_max_loss_pct: 15.0    # 주간 누적 손실 비율 초과 시 신규 진입 중단 (0이면 비활성)
+
+# --- 실행 레이어 (재시도·알림) ---
+execution:
+  max_retries: 3
+  retry_delay_sec: 2
+  alert_on_failure: true       # MT5/주문 실패 시 텔레그램 알림
+  alert_on_monitor_stop: true  # 모니터 비정상 종료 시 알림
+
+# --- 로그 ---
+logging:
+  structured: true              # JSON 한 줄 로그 사용
+  log_dir: "logs"              # v2 폴더 기준 상대 경로
+  log_file: "trading.log"
+  include_console: true
+
+# --- 성과 리포트 ---
+performance_report:
+  db_path_env: "WINDOWS_SCHEDULER_DB"  # 환경변수로 DB 경로 지정 가능
+  report_dir: "reports"
