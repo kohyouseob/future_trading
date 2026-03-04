@@ -2,7 +2,6 @@
 """
 포지션 모니터(1H 레벨 청산)를 시작/정지하고 결과를 표시하는 Windows GUI 런처. (v2)
 경로·DB는 이 파일이 있는 v2 폴더 기준(db_config → v2/scheduler.db).
-입출금 버튼: mt5_deposit_withdrawal.py 실행 (파일 없으면 클릭 시 로그에 경로·안내 출력). 노션 미연동 시 KTR은 DB만 저장.
 실행: python position_monitor_launcher.py  또는  pythonw position_monitor_launcher.py (콘솔 숨김)
 
 pythonw 로 실행 시 창이 안 뜨면:
@@ -16,7 +15,7 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime, date
+from datetime import datetime
 
 # 스크립트가 있는 디렉터리(v2)로 이동 (pythonw/바로가기 실행 시 CWD 안정화)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,7 +28,6 @@ if os.path.isdir(SCRIPT_DIR):
 import tkinter as tk
 from tkinter import scrolledtext, font as tkfont, messagebox, ttk
 MONITOR_SCRIPT = os.path.join(SCRIPT_DIR, "position_monitoring_closing.py")
-DEPOSIT_SCRIPT = os.path.join(SCRIPT_DIR, "mt5_deposit_withdrawal.py")
 try:
     from db_config import UNIFIED_DB_PATH
     KTR_DB_PATH = UNIFIED_DB_PATH
@@ -40,8 +38,6 @@ except ImportError:
     PM_DB_PATH = _FALLBACK_DB
 LOG_FILE_PATH = os.path.join(SCRIPT_DIR, "position_monitor_launcher.log")
 LOG_RETENTION_DAYS = 7
-# 입출금 자동 실행: 해당 날짜(YYYY-MM-DD)에 이미 실행했으면 스킵 (런처 재시작해도 하루 1회 유지)
-DEPOSIT_LAST_RUN_FILE = os.path.join(SCRIPT_DIR, "position_monitor_deposit_last_run.txt")
 BB_TF_FILE = os.path.join(SCRIPT_DIR, "position_monitor_bb_tf.txt")
 BB_REFRESH_SCRIPT = os.path.join(SCRIPT_DIR, "position_monitor_bb_refresh.py")
 BAR_BACKFILL_SCRIPT = os.path.join(SCRIPT_DIR, "position_monitor_bar_backfill.py")
@@ -92,14 +88,10 @@ class MonitorLauncherApp:
         self._log_file = None
         self._log_file_start_time = None
         self._log_file_lock = threading.Lock()
-        self._last_deposit_run_date = None  # 매일 1회 입출금 실행용 (메모리 캐시; 파일이 우선)
-        self._deposit_skip_telegram_sent = False  # 오늘 이미 실행되어 스킵 시 텔레그램 1회만 전송
         self._build_ui()
         self._poll_log_queue()
         # 창이 뜨면 자동으로 모니터 시작
         self.root.after(0, self._on_start)
-        # 매일 08:04 입출금 자동 실행 (1분마다 시각 확인)
-        self.root.after(10000, self._check_deposit_schedule)
 
     def _build_ui(self):
         notebook = ttk.Notebook(self.root)
@@ -124,7 +116,7 @@ class MonitorLauncherApp:
         top = tk.Frame(tab_monitor, padx=8, pady=6)
         top.pack(fill=tk.X)
 
-        # 1행: 로그 지우기, MT5 재시작, 입출금, 강제청산 심볼 선택, 강제청산(맨 오른쪽) — 청산은 항상 실행
+        # 1행: 로그 지우기, MT5 재시작, 강제청산 심볼 선택, 강제청산(맨 오른쪽) — 청산은 항상 실행
         row1 = tk.Frame(top)
         row1.pack(fill=tk.X, pady=(0, 4))
         tk.Button(row1, text="로그 지우기", command=self._clear_log, width=8, font=tkfont.Font(size=9)).pack(side=tk.LEFT, padx=(0, 4))
@@ -133,11 +125,6 @@ class MonitorLauncherApp:
             width=8, font=tkfont.Font(size=9, weight="bold"),
         )
         self.btn_restart_mt5.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_deposit = tk.Button(
-            row1, text="입출금", command=self._on_deposit_withdrawal,
-            width=6, font=tkfont.Font(size=9, weight="bold"),
-        )
-        self._btn_deposit.pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(
             row1, text="High/Low", command=self._on_high_low_update,
             width=8, font=tkfont.Font(size=9),
@@ -1001,83 +988,6 @@ class MonitorLauncherApp:
                 self.log_queue.put((kind, line))
         except (ValueError, BrokenPipeError):
             pass
-
-    def _check_deposit_schedule(self):
-        try:
-            now = datetime.now()
-            today = now.date()
-            today_str = today.isoformat()
-            # 파일에 오늘 날짜가 있으면 이미 오늘 실행됨 → 스킵 (런처 재시작해도 하루 1회)
-            try:
-                if os.path.isfile(DEPOSIT_LAST_RUN_FILE):
-                    with open(DEPOSIT_LAST_RUN_FILE, "r", encoding="utf-8") as f:
-                        saved = (f.read() or "").strip()
-                    if saved == today_str:
-                        self._last_deposit_run_date = today
-                        # 프로그램 재시작 후 스킵 시 텔레그램으로 한 번 알림
-                        if not getattr(self, "_deposit_skip_telegram_sent", True):
-                            self._deposit_skip_telegram_sent = True
-                            try:
-                                from telegram_sender_utils import send_telegram_msg
-                                msg = (
-                                    f"⏭️ **MT5 입출금일지** 업데이트 스킵\n"
-                                    f"오늘({today_str}) 이미 실행되어 자동 실행하지 않습니다."
-                                )
-                                run_in_thread(lambda: send_telegram_msg(msg), daemon=True)
-                            except Exception:
-                                pass
-                        self.root.after(60000, self._check_deposit_schedule)
-                        return
-            except Exception:
-                pass
-            if self._last_deposit_run_date != today and os.path.isfile(DEPOSIT_SCRIPT):
-                # 08:04에 1회 실행. 1분 간격 체크라 08:04를 놓칠 수 있으므로 08:05~08:59 보충 구간 추가
-                if now.hour == 8 and now.minute == 4:
-                    self._last_deposit_run_date = today
-                    self.log_queue.put(("out", "\n[입출금 자동] 08:04 실행\n"))
-                    self._on_deposit_withdrawal()
-                elif now.hour == 8 and 5 <= now.minute <= 59:
-                    self._last_deposit_run_date = today
-                    self.log_queue.put(("out", f"\n[입출금 자동] 08:04 보충 실행 ({now.hour:02d}:{now.minute:02d})\n"))
-                    self._on_deposit_withdrawal()
-        except Exception:
-            pass
-        self.root.after(60000, self._check_deposit_schedule)
-
-    def _on_deposit_withdrawal(self):
-        if not os.path.isfile(DEPOSIT_SCRIPT):
-            self._log(f"오류: 스크립트를 찾을 수 없습니다.\n  {DEPOSIT_SCRIPT}\n", "stderr")
-            return
-        # 실행한 날짜 기록 → 자동 스케줄이 같은 날 다시 실행하지 않음 (하루 1회)
-        try:
-            today_str = date.today().isoformat()
-            with open(DEPOSIT_LAST_RUN_FILE, "w", encoding="utf-8") as f:
-                f.write(today_str)
-        except Exception:
-            pass
-        self._last_deposit_run_date = date.today()
-        self.log_queue.put(("out", "\n[입출금] mt5_deposit_withdrawal.py 실행 중...\n"))
-
-        def _run():
-            try:
-                proc = subprocess.Popen(
-                    [sys.executable, "-u", DEPOSIT_SCRIPT],
-                    cwd=SCRIPT_DIR,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
-                )
-                run_in_thread(lambda: self._read_pipe_to_queue(proc.stdout, "out"), daemon=True)
-                run_in_thread(lambda: self._read_pipe_to_queue(proc.stderr, "err"), daemon=True)
-                proc.wait()
-                self.log_queue.put(("out", f"[입출금] 완료 (종료코드 {proc.returncode}).\n"))
-            except Exception as e:
-                self.log_queue.put(("err", f"[입출금] 실행 오류: {e}\n"))
-
-        run_in_thread(_run, daemon=True)
 
     def _on_bar_backfill(self):
         """BAR 테이블 보충 + 볼린저밴드 재계산 실행 (로그는 스크립트에서 텔레그램 전송)."""

@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 
 from telegram_sender_utils import send_telegram_msg
 from ktr_sltp_updater import _parse_comment
-from ktr_sltp_utils import get_tp_level
+from ktr_sltp_utils import get_tp_level, get_ktr_from_db_auto
 import position_monitor_db as pm_db
 
 load_dotenv()
@@ -85,6 +85,16 @@ try:
 except ValueError:
     pass
 
+# 잔액(balance) 대비 마진이 이 비율(%)을 초과하면 가장 나중에 만들어진 오더 1건 청산 (예: 7% 초과 시 최신 포지션 1건 청산).
+MARGIN_PCT_CLOSE_LAST_ORDER = 7.0
+_margin_pct_last = os.getenv("POSITION_MONITOR_MARGIN_PCT_CLOSE_LAST", "7").strip()
+try:
+    _mp = float(_margin_pct_last)
+    if _mp > 0:
+        MARGIN_PCT_CLOSE_LAST_ORDER = _mp
+except ValueError:
+    pass
+
 # 수익금이 잔액의 이 비율을 초과하면 전 포지션 청산 후 동일 규모로 재진입 (수익 실현).
 PROFIT_TAKE_PCT = 50.0
 
@@ -92,9 +102,7 @@ PROFIT_TAKE_PCT = 50.0
 
 # KTR 예약 진입 매직. 이 매직이 아니면 수작업(MT5 직접) 오더로 간주.
 MAGIC_KTR = 888001
-# 수작업 오더 진입 허용 시간: 매시 0~10분(KST). 그 외 시간에 진입한 수작업 오더는 조회 즉시 청산(단, 수익 중인 포지션은 청산하지 않음).
-MANUAL_ENTRY_ALLOWED_MIN_START = 0
-MANUAL_ENTRY_ALLOWED_MIN_END = 10
+# (삭제됨) 수작업 오더 진입 시간 제한 — 오더 만들 수 있는 시간 제한 없음.
 
 # 세션별 기준 봉 + 구간 (KST). 기준 봉 High 초과 Close → Short 청산, Low 하회 Close → Long 청산
 KST = pytz.timezone("Asia/Seoul")
@@ -538,6 +546,42 @@ def sma_last(closes: List[float], period: int) -> Optional[float]:
     return sum(closes[-period:]) / period
 
 
+def _rma_series(values: List[float], length: int) -> Optional[List[float]]:
+    """Wilder RMA. First = SMA of first length, then rma[i] = (rma[i-1]*(length-1)+values[i])/length."""
+    if not values or length < 1 or len(values) < length:
+        return None
+    out: List[float] = []
+    out.append(sum(values[:length]) / length)
+    for i in range(length, len(values)):
+        out.append((out[-1] * (length - 1) + values[i]) / length)
+    return out
+
+
+def _rsi_series(closes_chron: List[float], period: int = 14) -> Optional[List[float]]:
+    """RSI(period) 시리즈. closes_chron = 과거→현재 순. 반환: 앞 period개 None, 이후 RSI 값."""
+    if not closes_chron or period < 1 or len(closes_chron) < period + 1:
+        return None
+    n = len(closes_chron)
+    gains = [0.0]
+    losses = [0.0]
+    for i in range(1, n):
+        ch = closes_chron[i] - closes_chron[i - 1]
+        gains.append(ch if ch > 0 else 0.0)
+        losses.append(-ch if ch < 0 else 0.0)
+    rma_g = _rma_series(gains, period)
+    rma_l = _rma_series(losses, period)
+    if not rma_g or not rma_l or len(rma_g) != n - period + 1 or len(rma_l) != n - period + 1:
+        return None
+    result: List[Optional[float]] = [None] * (period - 1)
+    for j in range(len(rma_g)):
+        g, l = rma_g[j], rma_l[j]
+        if l <= 0:
+            result.append(100.0)
+        else:
+            result.append(100.0 - 100.0 / (1.0 + g / l))
+    return result
+
+
 def bollinger_upper(closes: List[float], period: int, num_std: float) -> Optional[float]:
     """볼린저 상단. TradingView Pine ta.stdev와 동일하게 표본 표준편차(n-1) 사용."""
     if len(closes) < period or period <= 1:
@@ -736,6 +780,9 @@ def should_close_on_three_bars_resistance(rates: Any) -> tuple[bool, str, List[s
 DOJI_BODY_RATIO_MAX = 0.2
 # 윗꼬리가 봉 전체 범위의 이 비율 이상이면 "긴 윗꼬리"
 LONG_UPPER_WICK_RATIO_MIN = 0.5
+# 돌파더블비 매수 청산: 4이평 위 도지/긴윗꼬리 + RSI <= RSI이동평균
+RSI_PERIOD = 14
+RSI_MA_PERIOD = 3
 
 # 장대음봉 판정: 과거 N개 2시간봉 중 음봉 TR(High-Low) 상위 몇 퍼센트를 기준으로 사용할지
 LARGE_BEAR_TOP_PERCENT = 1.0
@@ -908,6 +955,98 @@ def should_close_on_doji_upper_wick(rates: Any) -> tuple[bool, str, List[str]]:
     detail_lines.append(
         f"  • 도지 윗꼬리: 20이평 위={above_sma20}, 4이평 위={above_sma4} | "
         f"이전봉 양봉={bullish_prev} | 직전봉 body/range={body2/range2:.2f}(도지={doji}), 윗꼬리/range={upper_wick/range2:.2f}(긴윗꼬리={long_upper_wick}) → "
+        f"{'해당사항 있음 (1)' if trigger else '해당사항 없음 (0)'}"
+    )
+    return trigger, reason, detail_lines
+
+
+def should_close_on_4ema_above_doji_or_long_upper_wick_rsi_below_ma(rates: Any) -> tuple[bool, str, List[str]]:
+    """
+    돌파더블비 매수 청산: 4이평이 20이평 위, 4이평 위에서 마감된 도지 또는 긴 윗꼬리 캔들, RSI <= RSI이동평균.
+    - 4이평 > 20이평
+    - 직전 봉(-2): 종가 > 4이평 (4이평 위에서 마감)
+    - 직전 봉: 도지(body/range <= 0.2) OR 긴 윗꼬리(윗꼬리 > 몸통)
+    - 직전 봉 시점 RSI(14) <= RSI(14)의 3봉 이동평균
+    returns: (청산 여부, 사유 문자열, 점검 상세 로그 목록)
+    """
+    detail_lines: List[str] = []
+    min_bars = max(21, 14 + RSI_MA_PERIOD + 2)  # 20이평 + RSI·RSI_MA 계산에 필요한 봉 수
+    if rates is None or len(rates) < min_bars:
+        detail_lines.append("  • 4이평위 도지/긴윗꼬리+RSI 청산: 봉 수 부족")
+        return False, "", detail_lines
+
+    # 현재 봉 제외, 직전 마감 봉까지의 종가
+    closes_ex_cur = [float(rates["close"][i]) for i in range(0, len(rates) - 1)]
+    last_close = closes_ex_cur[-1]
+    sma4 = sma_last(closes_ex_cur, SMA4_PERIOD)
+    sma20 = sma_last(closes_ex_cur, SMA_PERIOD)
+    if sma4 is None or sma20 is None:
+        detail_lines.append("  • 4이평위 도지/긴윗꼬리+RSI 청산: 4/20이평 계산 불가")
+        return False, "", detail_lines
+
+    # 조건 1: 4이평 > 20이평
+    ema4_above_ema20 = sma4 > sma20
+    if not ema4_above_ema20:
+        detail_lines.append(
+            f"  • 4이평위 도지/긴윗꼬리+RSI: 4이평 {sma4:.2f} <= 20이평 {sma20:.2f} → 해당 없음"
+        )
+        return False, "", detail_lines
+
+    # 조건 2: 직전 봉 4이평 위에서 마감
+    above_sma4 = last_close > sma4
+    if not above_sma4:
+        detail_lines.append(
+            f"  • 4이평위 도지/긴윗꼬리+RSI: 직전봉 종가 {last_close:.2f} <= 4이평 {sma4:.2f} → 해당 없음"
+        )
+        return False, "", detail_lines
+
+    # 직전 봉(-2): 도지 또는 긴 윗꼬리 (몸통보다 윗꼬리가 긴 캔들)
+    o2 = float(rates["open"][-2])
+    c2 = float(rates["close"][-2])
+    h2 = float(rates["high"][-2])
+    l2 = float(rates["low"][-2])
+    body2 = abs(c2 - o2)
+    range2 = h2 - l2
+    top2 = max(o2, c2)
+    upper_wick2 = h2 - top2
+    if range2 <= 0:
+        detail_lines.append("  • 4이평위 도지/긴윗꼬리+RSI: 직전 봉 범위 0 → 해당 없음")
+        return False, "", detail_lines
+    doji = (body2 / range2) <= DOJI_BODY_RATIO_MAX
+    long_upper_wick = upper_wick2 > body2  # 몸통보다 윗꼬리가 긴 캔들
+    candle_ok = doji or long_upper_wick
+    if not candle_ok:
+        detail_lines.append(
+            f"  • 4이평위 도지/긴윗꼬리+RSI: 직전봉 도지={doji}, 윗꼬리>몸통={long_upper_wick} → 해당 없음"
+        )
+        return False, "", detail_lines
+
+    # RSI(14) 및 RSI 3봉 이동평균 (직전 봉 시점)
+    rsi_series = _rsi_series(closes_ex_cur, RSI_PERIOD)
+    if rsi_series is None or len(rsi_series) != len(closes_ex_cur):
+        detail_lines.append("  • 4이평위 도지/긴윗꼬리+RSI: RSI 계산 불가")
+        return False, "", detail_lines
+    # RSI 시리즈에서 직전 봉에 해당하는 값 = 마지막 유효 RSI
+    rsi_last_val: Optional[float] = None
+    for i in range(len(rsi_series) - 1, -1, -1):
+        if rsi_series[i] is not None:
+            rsi_last_val = rsi_series[i]
+            break
+    if rsi_last_val is None:
+        detail_lines.append("  • 4이평위 도지/긴윗꼬리+RSI: 직전 봉 RSI 없음")
+        return False, "", detail_lines
+    # 직전 3개 RSI의 평균
+    rsi_valid = [v for v in rsi_series if v is not None]
+    if len(rsi_valid) < RSI_MA_PERIOD:
+        detail_lines.append("  • 4이평위 도지/긴윗꼬리+RSI: RSI MA 계산 불가 (데이터 부족)")
+        return False, "", detail_lines
+    rsi_ma = sum(rsi_valid[-RSI_MA_PERIOD:]) / RSI_MA_PERIOD
+    rsi_below_or_eq_ma = rsi_last_val <= rsi_ma
+    trigger = rsi_below_or_eq_ma
+    reason = "4이평 위 도지/긴윗꼬리 + RSI<=RSI이동평균" if trigger else ""
+    detail_lines.append(
+        f"  • 4이평위 도지/긴윗꼬리+RSI: 4>20={ema4_above_ema20}, 직전봉 4위마감={above_sma4}, "
+        f"도지={doji} 윗꼬리>몸통={long_upper_wick} | RSI={rsi_last_val:.1f} RSI_MA={rsi_ma:.1f} → "
         f"{'해당사항 있음 (1)' if trigger else '해당사항 없음 (0)'}"
     )
     return trigger, reason, detail_lines
@@ -1553,6 +1692,85 @@ def close_all_if_margin_level_below(threshold: float = MARGIN_LEVEL_CLOSE_PCT) -
     return result
 
 
+def close_last_position_if_margin_over_pct(threshold_pct: float = MARGIN_PCT_CLOSE_LAST_ORDER) -> Optional[Tuple[List[dict], float]]:
+    """잔액(balance) 대비 마진이 threshold_pct(%)를 초과하면 가장 나중에 만들어진 포지션 1건만 청산.
+    반환: (청산된 포지션 정보 목록 1건, 마진비율%) 또는 조건 미충족/실패 시 None."""
+    positions = mt5.positions_get()
+    if not positions:
+        return None
+    acc = tr.get_account_info()
+    if acc is None:
+        return None
+    balance = float(acc.get("balance", 0) or 0)
+    if balance <= 0:
+        return None
+    margin = float(acc.get("margin", 0) or 0)
+    margin_ratio_pct = (margin / balance * 100.0) if balance > 0 else 0.0
+    if margin_ratio_pct <= threshold_pct:
+        return None
+    # 가장 나중에 만들어진 포지션 1건 (time 또는 time_msc 기준 최대)
+    latest = max(
+        positions,
+        key=lambda p: (getattr(p, "time_msc", 0) or 0) or (getattr(p, "time", 0) or 0) * 1000,
+    )
+    ok, msg = tr.close_market_order(symbol=latest.symbol, ticket=latest.ticket, volume=latest.volume)
+    if not ok:
+        print(f"  [마진7%%초과 청산] 최신 포지션 #{latest.ticket} {latest.symbol} 청산 실패: {msg}", flush=True)
+        return None
+    closed_list = [{
+        "symbol": latest.symbol,
+        "ticket": latest.ticket,
+        "type": "BUY" if latest.type == mt5.ORDER_TYPE_BUY else "SELL",
+        "volume": latest.volume,
+        "profit": latest.profit + latest.swap,
+    }]
+    print(f"[마진7%%초과] 잔액 대비 마진 {margin_ratio_pct:.1f}% > {threshold_pct}% → 최신 포지션 1건 청산: {latest.symbol} #{latest.ticket}", flush=True)
+    return (closed_list, margin_ratio_pct)
+
+
+def _cancel_pending_orders_interval_less_than_5m_ktr() -> None:
+    """예약 오더(KTR 매직)를 점검해, 인접 예약 간격이 5분봉 KTR(또는 KTR<10이면 2*KTR)보다 작으면 해당 예약 오더 삭제."""
+    orders = mt5.orders_get() or []
+    ktr_pending = [o for o in orders if getattr(o, "magic", 0) == MAGIC_KTR]
+    if not ktr_pending:
+        return
+    ot_buy_limit = getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2)
+    ot_sell_limit = getattr(mt5, "ORDER_TYPE_SELL_LIMIT", 3)
+    limit_orders = [o for o in ktr_pending if getattr(o, "type", -1) in (ot_buy_limit, ot_sell_limit)]
+    if not limit_orders:
+        return
+    symbols = list({o.symbol for o in limit_orders})
+    to_cancel: List[int] = []
+    for symbol in symbols:
+        ktr_value, _ = get_ktr_from_db_auto(symbol, "5M")
+        if not ktr_value or ktr_value <= 0:
+            continue
+        min_interval = (2.0 * ktr_value) if ktr_value < 10 else float(ktr_value)
+        buy_orders = [o for o in limit_orders if o.symbol == symbol and o.type == ot_buy_limit]
+        sell_orders = [o for o in limit_orders if o.symbol == symbol and o.type == ot_sell_limit]
+        for order_list, descending in [(buy_orders, True), (sell_orders, False)]:
+            if len(order_list) < 2:
+                continue
+            order_list = sorted(order_list, key=lambda o: float(getattr(o, "price_open", 0) or getattr(o, "price_current", 0)), reverse=descending)
+            for i in range(len(order_list) - 1):
+                p1 = float(getattr(order_list[i], "price_open", 0) or getattr(order_list[i], "price_current", 0))
+                p2 = float(getattr(order_list[i + 1], "price_open", 0) or getattr(order_list[i + 1], "price_current", 0))
+                gap = abs(p1 - p2)
+                if gap < min_interval:
+                    to_cancel.append(order_list[i + 1].ticket)
+    if not to_cancel:
+        return
+    cancelled = 0
+    for ticket in to_cancel:
+        result = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": ticket})
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            cancelled += 1
+        else:
+            print(f"  [예약 간격 삭제] #{ticket} 취소 실패: {getattr(result, 'comment', '')}", flush=True)
+    if cancelled:
+        print(f"  [예약 간격] 5M KTR 기준 간격 미달 예약 오더 {cancelled}건 삭제", flush=True)
+
+
 def close_all_and_reenter_if_profit_over_pct(threshold_pct: float = PROFIT_TAKE_PCT) -> Optional[Tuple[List[dict], float, List[dict], List[Tuple[str, str, float, str]]]]:
     """수익금이 잔액의 threshold_pct(%)를 초과하면 전 포지션 청산 후, 청산한 포지션과 동일한 심볼·방향·랏수로 시장가 재진입.
     반환: (청산 목록, 수익률%, 재진입 성공 목록, 재진입 실패 목록 [(symbol, side, volume, err)]) 또는 조건 미충족 시 None."""
@@ -1745,63 +1963,8 @@ def _position_open_time_kst(pos: Any) -> Optional[datetime]:
 
 
 def close_manual_orders_outside_allowed_time() -> bool:
-    """
-    수작업(MT5 직접) 오더는 진입 시각이 매시 0~10분(KST)이어야 함.
-    그 외 시간에 진입한 수작업 오더는 조회 즉시 청산. 단, 수익 중인 포지션은 청산하지 않음.
-    실행한 청산이 있으면 True.
-    """
-    positions = mt5.positions_get()
-    if not positions:
-        return False
-    to_close: List[Any] = []
-    for pos in positions:
-        if getattr(pos, "magic", 0) == MAGIC_KTR:
-            continue
-        open_dt = _position_open_time_kst(pos)
-        if open_dt is None:
-            to_close.append(pos)
-            continue
-        if not (MANUAL_ENTRY_ALLOWED_MIN_START <= open_dt.minute <= MANUAL_ENTRY_ALLOWED_MIN_END):
-            # 수익 중이면 청산하지 않음 (손실 또는 0일 때만 청산)
-            if (getattr(pos, "profit", 0) or 0) + (getattr(pos, "swap", 0) or 0) > 0:
-                continue
-            to_close.append(pos)
-    if not to_close:
-        return False
-    closed_list: List[dict] = []
-    for pos in to_close:
-        ok, msg = tr.close_market_order(symbol=pos.symbol, ticket=pos.ticket, volume=pos.volume)
-        if ok:
-            closed_list.append({
-                "symbol": pos.symbol,
-                "ticket": pos.ticket,
-                "type": "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL",
-                "volume": pos.volume,
-                "profit": pos.profit + pos.swap,
-            })
-            open_dt = _position_open_time_kst(pos)
-            t_str = open_dt.strftime("%H:%M") if open_dt else "?"
-            print(f"  [수작업 청산] {pos.symbol} #{pos.ticket} 진입시각 {t_str} (매시 0~10분 아님) → 청산", flush=True)
-        else:
-            print(f"  ❌ [수작업 청산 실패] {pos.symbol} #{pos.ticket}: {msg}", flush=True)
-    if closed_list:
-        _log_closes_to_file("수작업_진입시간위반", closed_list)
-        n, errs = tr.cancel_pending_orders()
-        if n:
-            print(f"  [예약 취소] 수작업 청산 후 미체결 {n}건 취소", flush=True)
-        total_profit = sum(c["profit"] for c in closed_list)
-        lines = [
-            "⚠️ **수작업 오더 청산 (진입 시간 위반)**",
-            f"• 수작업 오더는 매시 0~10분(KST)에만 진입 가능. 그 외 시간 진입분 중 손실/무익만 즉시 청산 (수익 중 제외).",
-            f"• 청산 {len(closed_list)}건, 합계: ${total_profit:+,.2f}",
-        ]
-        for c in closed_list:
-            lines.append(f"  └ {c['symbol']} #{c['ticket']} {c['type']} ${c['profit']:+,.2f}")
-        try:
-            _send_telegram("\n".join(lines))
-        except Exception as e:
-            print(f"  ⚠️ 수작업 청산 결과 텔레그램 전송 실패: {e}", flush=True)
-    return len(closed_list) > 0
+    """(비활성화) 수작업 오더 진입 시간 제한 삭제됨 — 항상 청산하지 않음."""
+    return False
 
 
 def close_all_positions_for_symbol(symbol: str, timeframe_from_comment: Optional[str] = None) -> List[dict]:
@@ -2130,6 +2293,9 @@ def _run_ktr_if_scheduled() -> None:
     current_min = h * 60 + m
 
     def _run_tf(sh: int, sm: int, tf: str) -> None:
+        # 같은 날 같은 슬롯 이미 실행됐으면 재실행·중복 전송 방지 (같은 분에 루프가 2번 돌 때 등)
+        if _ktr_last_run_date.get((sh, sm, tf)) == today:
+            return
         session = KTR_SCHEDULE_SESSION.get((sh, sm, tf))
         if session:
             try:
@@ -2142,6 +2308,8 @@ def _run_ktr_if_scheduled() -> None:
             except Exception as e:
                 print(f"  [KTR] DB 확인 오류 (측정 진행): {e}", flush=True)
         try:
+            # 실행 직전에 표시해, 같은 분에 루프가 한 번 더 돌아도 중복 실행·중복 전송 방지
+            _ktr_last_run_date[(sh, sm, tf)] = today
             if tf == "5M":
                 from ktr_measure_calculator import run_5m
                 run_5m(ktr_db_path=KTR_DB_PATH)
@@ -2151,10 +2319,11 @@ def _run_ktr_if_scheduled() -> None:
             else:
                 from ktr_measure_calculator import run_1h
                 run_1h(ktr_db_path=KTR_DB_PATH)
-            _ktr_last_run_date[(sh, sm, tf)] = today
             print(f"  [KTR] {sh:02d}:{sm:02d} {tf} 스케줄 실행 완료 (DB 반영)", flush=True)
         except Exception as e:
             print(f"  [KTR] 스케줄 실행 오류: {e}", flush=True)
+            if (sh, sm, tf) in _ktr_last_run_date and _ktr_last_run_date[(sh, sm, tf)] == today:
+                del _ktr_last_run_date[(sh, sm, tf)]  # 실패 시 재시도 가능하도록 제거
 
     for sh, sm, tf in KTR_SCHEDULE:
         if (h, m) == (sh, sm):
@@ -2180,6 +2349,9 @@ def _run_ktr_catchup_if_missed() -> None:
     catchup_end = now - timedelta(minutes=KTR_CATCHUP_WINDOW_MINUTES)
 
     def _run_tf(sh: int, sm: int, tf: str) -> None:
+        # 같은 날 같은 슬롯 이미 실행됐으면 재실행·중복 전송 방지
+        if _ktr_last_run_date.get((sh, sm, tf)) == today:
+            return
         session = KTR_SCHEDULE_SESSION.get((sh, sm, tf))
         if session:
             try:
@@ -2192,6 +2364,8 @@ def _run_ktr_catchup_if_missed() -> None:
             except Exception as e:
                 print(f"  [KTR] DB 확인 오류 (측정 진행): {e}", flush=True)
         try:
+            # 실행 직전에 표시해 중복 실행·중복 전송 방지
+            _ktr_last_run_date[(sh, sm, tf)] = today
             if tf == "5M":
                 from ktr_measure_calculator import run_5m
                 run_5m(ktr_db_path=KTR_DB_PATH)
@@ -2201,10 +2375,11 @@ def _run_ktr_catchup_if_missed() -> None:
             else:
                 from ktr_measure_calculator import run_1h
                 run_1h(ktr_db_path=KTR_DB_PATH)
-            _ktr_last_run_date[(sh, sm, tf)] = today
             print(f"  [KTR] {sh:02d}:{sm:02d} {tf} 보충 실행 완료 (5분 점검 시 누락 확인)", flush=True)
         except Exception as e:
             print(f"  [KTR] 스케줄 보충 실행 오류: {e}", flush=True)
+            if (sh, sm, tf) in _ktr_last_run_date and _ktr_last_run_date[(sh, sm, tf)] == today:
+                del _ktr_last_run_date[(sh, sm, tf)]  # 실패 시 재시도 가능하도록 제거
 
     for sh, sm, tf in KTR_SCHEDULE:
         scheduled_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
@@ -2484,10 +2659,6 @@ def run_one_check() -> None:
 
     closing_enabled = _is_closing_enabled()
     if closing_enabled:
-        # 수작업(MT5 직접) 오더: 매시 0~10분 외 진입분 즉시 청산
-        if close_manual_orders_outside_allowed_time():
-            positions = mt5.positions_get()
-
         now_kst = datetime.now(KST)
 
         # 23:25 전 포지션 강제 청산 (월~금 23:25~23:29, 하루 1회)
@@ -2532,6 +2703,19 @@ def run_one_check() -> None:
         if margin_stops:
             positions = mt5.positions_get()
 
+        # 잔액 대비 마진이 기준(7%) 초과 시 가장 나중에 만들어진 오더 1건 청산
+        margin_last_result = close_last_position_if_margin_over_pct(MARGIN_PCT_CLOSE_LAST_ORDER)
+        if margin_last_result:
+            closed_list, margin_ratio_pct = margin_last_result
+            _log_closes_to_file("마진7%초과_최신1건청산", closed_list, f"잔액대비 마진 {margin_ratio_pct:.1f}%")
+            total_profit = sum(c["profit"] for c in closed_list)
+            _send_telegram(
+                f"⚠️ **잔액 대비 마진 초과 → 최신 포지션 1건 청산**\n"
+                f"• 잔액 대비 마진 {margin_ratio_pct:.1f}% > {MARGIN_PCT_CLOSE_LAST_ORDER:.0f}% → 가장 나중에 만들어진 오더 1건 청산\n"
+                f"• 청산 손익: ${total_profit:+,.2f}"
+            )
+            positions = mt5.positions_get()
+
         # 전체 증거금 대비 합계 손실률이 기준 이하이면 전 포지션 청산 (예: 증거금 1000$, 손실 100$ → -10%)
         symbol_stops = close_all_if_overall_loss_rate_below(OVERALL_LOSS_RATE_STOP_THRESHOLD)
         for symbol, closed_list, loss_rate_pct in symbol_stops:
@@ -2559,6 +2743,9 @@ def run_one_check() -> None:
 
     # 10분봉 4B/20B 자동오더: 예약 주문 가격을 현재 10M 20B/4B 하단(오프셋)으로 갱신
     _update_m10_bb_auto_order_prices()
+
+    # 예약 오더 간격 점검: 5분봉 KTR보다 작으면 삭제 (KTR<10이면 2*KTR 기준)
+    _cancel_pending_orders_interval_less_than_5m_ktr()
 
     # T/P·S/L 등으로 포지션이 없어진 심볼: 해당 심볼 KTR 대기 오더 전부 삭제
     orders = mt5.orders_get() or []
@@ -2601,6 +2788,8 @@ def run_one_check() -> None:
         if len(closes_ex_cur) < 20:
             print(f"  [Long T/P] #{pos.ticket} {symbol} {tf_comment} 스킵: 종가 20개 미만", flush=True)
             continue
+        # 20이평: 현재 봉 제외, 직전 마감 봉 포함 최근 20개 봉 종가의 단순평균(SMA).
+        # t0<t_end(과거→현재): sma_last = 마지막 20개 종가 평균. t0>=t_end: 앞 20개 = 최근 20봉 종가 평균.
         if t0 < t_end:
             sma20 = sma_last(closes_ex_cur, SMA_PERIOD)
         else:
@@ -2756,6 +2945,38 @@ def run_one_check() -> None:
                         closed_sma20_inverse = True
                         break
             if closed_sma20_inverse:
+                continue
+
+            # 돌파더블비 매수 청산: 4이평 > 20이평, 4이평 위에서 마감된 도지 또는 긴 윗꼬리 캔들, RSI <= RSI이동평균
+            closed_4ema_doji_rsi = False
+            for tf_comment in timeframes_in_use:
+                rates_tf_str = _comment_tf_to_rates_tf(tf_comment)
+                rates = get_rates_for_tf(symbol, rates_tf_str, count=130)
+                if rates is None or len(rates) < max(21, 14 + RSI_MA_PERIOD + 2):
+                    continue
+                trigger, reason, detail_lines = should_close_on_4ema_above_doji_or_long_upper_wick_rsi_below_ma(rates)
+                if not trigger:
+                    continue
+                closed = close_all_positions_for_symbol_by_timeframe(symbol, tf_comment)
+                if closed:
+                    _log_closes_to_file("4이평위_도지긴윗꼬리_RSI", closed, f"{symbol} {tf_comment}")
+                    total_profit = sum(c["profit"] for c in closed)
+                    lines = [
+                        f"🔒 **4이평 위 도지/긴윗꼬리 + RSI≤RSI이동평균 청산** [{symbol}] ({tf_comment})",
+                        f"• {reason}",
+                        f"• 해당 TF Long 포지션 {len(closed)}건 청산. 합계 수익: ${total_profit:+,.2f}",
+                        "",
+                    ]
+                    lines.extend(detail_lines)
+                    _send_telegram("\n".join(lines))
+                    _remove_reservations_for_symbol(symbol)
+                    print(f"✅ [{symbol}] 4이평위 도지/긴윗꼬리+RSI({tf_comment}) → Long 청산 {len(closed)}건")
+                    positions = mt5.positions_get()
+                    if not positions:
+                        return
+                    closed_4ema_doji_rsi = True
+                    break
+            if closed_4ema_doji_rsi:
                 continue
 
             # 20/120 이평 모두 돌파 실패 청산: 직전 마감 봉 종가가 20이평·120이평 모두 아래이면,

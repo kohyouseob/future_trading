@@ -91,3 +91,19 @@ CREATE TABLE IF NOT EXISTS position_status_sent (
     sent_at TEXT NOT NULL
 );
 ALTER TABLE position_status_sent DISABLE ROW LEVEL SECURITY;
+
+-- 7) 돌파더블비 예약 (breakout_order_gui 예약 목록)
+CREATE TABLE IF NOT EXISTS breakout_reservations (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    tfs TEXT NOT NULL,
+    weight_pct REAL NOT NULL DEFAULT 1.0,
+    tp_enabled BOOLEAN NOT NULL DEFAULT false,
+    tp_ktr TEXT NOT NULL DEFAULT '1',
+    tp_x2 BOOLEAN NOT NULL DEFAULT false,
+    side TEXT NOT NULL DEFAULT '매수',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE breakout_reservations DISABLE ROW LEVEL SECURITY;
+-- 기존 테이블에 side 컬럼이 없으면 추가 (마이그레이션)
+ALTER TABLE breakout_reservations ADD COLUMN IF NOT EXISTS side TEXT NOT NULL DEFAULT '매수';

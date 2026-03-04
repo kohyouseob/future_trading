@@ -75,15 +75,16 @@ def _tg(msg: str) -> None:
 
 
 def send_telegram(market: str, balance: float, results_list: list, timeframe: str) -> None:
+    """KTR 측정 성공 시 한 번만 전송. 포맷: 사용자 지정 (Markdown 없이)."""
     tf_label = "5M" if timeframe == "5M" else ("10M" if timeframe == "10M" else "1H")
-    msg = f"📊 **{market} Market KTR {tf_label} 리포트**\n"
-    msg += f"💰 Balance: `${balance:,.2f}`\n"
-    msg += f"{'─' * 20}\n"
+    msg = f"📊 {market} Market KTR {tf_label} 리포트\n"
+    msg += f"💰 Balance: ${balance:,.2f}\n"
+    msg += "────────────────────\n"
     for r in results_list:
-        msg += f"🔸 **{r['symbol']}** (KTR: {r['ktr']})\n"
-        msg += f"└ 1st: `{r['lot_1st']}` lot\n"
-        msg += f"└ 2nd: `{r['lot_2nd']}` lot\n"
-        msg += f"└ 3rd: `{r['lot_3rd']}` lot\n\n"
+        msg += f"🔸 {r['symbol']} (KTR: {r['ktr']})\n"
+        msg += f"└ 1st: {r['lot_1st']} lot\n"
+        msg += f"└ 2nd: {r['lot_2nd']} lot\n"
+        msg += f"└ 3rd: {r['lot_3rd']} lot\n\n"
     msg += "※ 로컬 DB 저장 완료"
     _tg(msg)
 
@@ -412,7 +413,6 @@ def run_5m(ktr_db_path: str | None = None, session_override: str | None = None, 
 
     if not quiet:
         print(f"\n▶ KTR 5M 레포트 시작: {ts}")
-        _tg(f"🟡 **KTR 5M 측정 시작** ({market_name})\n{ts}")
 
     final_results = []
     failed_list = []  # [{"symbol": str, "reason": str}, ...]
@@ -436,7 +436,7 @@ def run_5m(ktr_db_path: str | None = None, session_override: str | None = None, 
                     print(f"⚠️ {name}: MT5/DB에 5M 봉 없음 - 스킵")
                 failed_list.append({"symbol": name, "reason": "데이터 없음"})
                 if not quiet:
-                    _tg(f"  ⚠️ **{name}** 5M: 데이터 없음 - 스킵")
+                    pass  # 텔레그램: 실패 시 _finish에서 한 번만 전송
                 continue
 
         if not quiet:
@@ -469,10 +469,7 @@ def run_5m(ktr_db_path: str | None = None, session_override: str | None = None, 
         })
         db_success_count += 1
         if not quiet:
-            if lot_1st > 0:
-                _tg(f"  ✓ **{name}** 5M KTR {ktr} DB 저장 완료")
-            else:
-                _tg(f"  ✓ **{name}** 5M KTR {ktr} DB 저장 완료 (랏수 0)")
+            pass  # 텔레그램: 성공 시 _finish에서 한 번만 전송
 
     _finish(market_name, balance, final_results, db_success_count, timeframe, failed_list, quiet=quiet)
     return db_success_count
@@ -491,7 +488,6 @@ def run_10m(ktr_db_path: str | None = None, session_override: str | None = None,
 
     if not quiet:
         print(f"\n▶ KTR 10M 레포트 시작: {ts}")
-        _tg(f"🟡 **KTR 10M 측정 시작** ({market_name})\n{ts}")
 
     final_results = []
     failed_list = []
@@ -515,7 +511,7 @@ def run_10m(ktr_db_path: str | None = None, session_override: str | None = None,
                     print(f"⚠️ {name}: MT5/DB에 10M 봉 없음 - 스킵")
                 failed_list.append({"symbol": name, "reason": "데이터 없음"})
                 if not quiet:
-                    _tg(f"  ⚠️ **{name}** 10M: 데이터 없음 - 스킵")
+                    pass  # 텔레그램: 실패 시 _finish에서 한 번만 전송
                 continue
 
         if not quiet:
@@ -548,10 +544,7 @@ def run_10m(ktr_db_path: str | None = None, session_override: str | None = None,
         })
         db_success_count += 1
         if not quiet:
-            if lot_1st > 0:
-                _tg(f"  ✓ **{name}** 10M KTR {ktr} DB 저장 완료")
-            else:
-                _tg(f"  ✓ **{name}** 10M KTR {ktr} DB 저장 완료 (랏수 0)")
+            pass  # 텔레그램: 성공 시 _finish에서 한 번만 전송
 
     _finish(market_name, balance, final_results, db_success_count, timeframe, failed_list, quiet=quiet)
     return db_success_count
@@ -570,7 +563,6 @@ def run_1h(ktr_db_path: str | None = None, session_override: str | None = None, 
 
     if not quiet:
         print(f"\n▶ KTR 1H 레포트 시작: {ts}")
-        _tg(f"🟡 **KTR 1H 측정 시작** ({market_name})\n{ts}")
 
     final_results = []
     failed_list = []
@@ -594,7 +586,7 @@ def run_1h(ktr_db_path: str | None = None, session_override: str | None = None, 
                     print(f"⚠️ {name}: MT5/DB에 1H 봉 없음 - 스킵")
                 failed_list.append({"symbol": name, "reason": "데이터 없음"})
                 if not quiet:
-                    _tg(f"  ⚠️ **{name}** 1H: 데이터 없음 - 스킵")
+                    pass  # 텔레그램: 실패 시 _finish에서 한 번만 전송
                 continue
 
         if not quiet:
@@ -627,10 +619,7 @@ def run_1h(ktr_db_path: str | None = None, session_override: str | None = None, 
         })
         db_success_count += 1
         if not quiet:
-            if lot_1st > 0:
-                _tg(f"  ✓ **{name}** 1H KTR {ktr} DB 저장 완료")
-            else:
-                _tg(f"  ✓ **{name}** 1H KTR {ktr} DB 저장 완료 (랏수 0)")
+            pass  # 텔레그램: 성공 시 _finish에서 한 번만 전송
 
     _finish(market_name, balance, final_results, db_success_count, timeframe, failed_list, quiet=quiet)
     return db_success_count
@@ -688,9 +677,13 @@ def _finish(
             print(summary)
     else:
         msg = f"⚠️ {market_name} KTR {tf_label} 처리 시 데이터를 찾지 못했습니다."
+        if failed_list:
+            reasons = ", ".join(f"{f['symbol']}: {f['reason']}" for f in failed_list)
+            msg += f"\n원인: {reasons}"
         log_cronjob(job_label, msg, is_error=True)
         if not quiet:
             print(msg)
+            _tg(msg)
 
 
 def main() -> None:

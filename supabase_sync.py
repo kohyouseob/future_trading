@@ -298,6 +298,91 @@ def get_session_high_low_supabase(symbol: str, session: str, session_date: str) 
         return None
 
 
+# ----- 돌파더블비 예약 (breakout_order_gui) -----
+
+def get_breakout_reservations_supabase() -> Optional[List[Dict[str, Any]]]:
+    """breakout_reservations 테이블 전체 조회. created_at 오름차순. 실패/비활성 시 None.
+    ※ side 컬럼은 요청하지 않음(테이블에 없으면 조회 실패하므로). 로드 시 side 없으면 '매수'로 처리.
+    테이블에 side 컬럼이 있으면 여기 select에 'side' 추가하면 됨."""
+    data = _get_supabase(
+        "breakout_reservations",
+        "id,symbol,tfs,weight_pct,tp_enabled,tp_ktr,tp_x2",
+        order="id.asc",
+        limit=500,
+    )
+    return data
+
+
+def insert_breakout_reservation_supabase(
+    symbol: str,
+    tfs_str: str,
+    weight_pct: float,
+    tp_enabled: bool,
+    tp_ktr: str,
+    tp_x2: bool,
+    side: str = "매수",
+) -> Optional[int]:
+    """breakout_reservations 1건 삽입. 반환: 생성된 id, 실패 시 None. side: '매수' | '매도'.
+    테이블에 side 컬럼이 없으면 side 없이 재시도하여 기존 스키마에서도 저장 가능."""
+    if not SUPABASE_SYNC_ENABLED or not _BASE:
+        return None
+    try:
+        import requests
+        url = f"{_BASE}/breakout_reservations"
+        payload_with_side = {
+            "symbol": symbol,
+            "tfs": tfs_str,
+            "weight_pct": weight_pct,
+            "tp_enabled": tp_enabled,
+            "tp_ktr": tp_ktr or "1",
+            "tp_x2": bool(tp_x2),
+            "side": (side or "매수").strip() or "매수",
+        }
+        payload_without_side = {
+            "symbol": symbol,
+            "tfs": tfs_str,
+            "weight_pct": weight_pct,
+            "tp_enabled": tp_enabled,
+            "tp_ktr": tp_ktr or "1",
+            "tp_x2": bool(tp_x2),
+        }
+        headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+        resp = requests.post(url, json=payload_with_side, headers=headers, timeout=15)
+        if resp.status_code not in (200, 201) and resp.status_code >= 400:
+            resp = requests.post(url, json=payload_without_side, headers=headers, timeout=15)
+        if resp.status_code not in (200, 201):
+            return None
+        out = resp.json()
+        row = out[0] if isinstance(out, list) and out else (out if isinstance(out, dict) else None)
+        if row and "id" in row:
+            return int(row["id"])
+        return None
+    except Exception as e:
+        _log.warning("Supabase breakout_reservations 삽입 실패: %s", e)
+        return None
+
+
+def delete_breakout_reservation_supabase(reservation_id: int) -> bool:
+    """breakout_reservations에서 id로 1건 삭제."""
+    if not SUPABASE_SYNC_ENABLED or not _BASE:
+        return False
+    try:
+        import requests
+        url = f"{_BASE}/breakout_reservations"
+        params = {"id": f"eq.{reservation_id}"}
+        headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"}
+        resp = requests.delete(url, headers=headers, params=params, timeout=10)
+        return resp.status_code in (200, 204)
+    except Exception as e:
+        _log.warning("Supabase breakout_reservations 삭제 실패: %s", e)
+        return False
+
+
 def sync_ktr_record(
     symbol: str,
     session: str,
